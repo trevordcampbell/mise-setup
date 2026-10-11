@@ -1,0 +1,16 @@
+.DS_Store
+__pycache__/
+*.pyc
+.env
+.env.*
+*.local.*
+.zsh_history
+.bash_history
+
+# Machine-local credentials and exported application data.
+local.zsh
+*.pem
+*.key
+credentials.json
+secrets.*
+*.log

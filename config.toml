@@ -1,0 +1,165 @@
+[settings]
+# Native Git uses shallow clones for managed branch checkouts.
+gix = false
+libgit2 = false
+idiomatic_version_file_enable_tools = ["node", "python", "rust", "pnpm"]
+tool_update.global_auto = true
+tool_update.check_duration = "24h"
+self_update.auto = true
+self_update.check_duration = "24h"
+minimum_release_age = "24h"
+
+[tools]
+node = "latest"
+python = "latest"
+bun = "latest"
+# Keep rustup's fallback correct when the previous global toolchain is pruned.
+rust = { version = "latest", postinstall = '"$HOME/.cargo/bin/rustup" default "${MISE_TOOL_INSTALL_PATH##*/}"' }
+pnpm = "latest"
+gh = "latest"
+"cargo:zpl_toolchain_cli" = "latest"
+"github:skw398/scap" = { version = "latest", asset_pattern = "scap.zip" }
+# Repair invalid ad-hoc signatures in verified Supabase release artifacts on macOS.
+supabase = { version = "latest", postinstall = "if [ \"$(uname -s)\" = Darwin ]; then for binary in \"$MISE_TOOL_INSTALL_PATH/supabase\" \"$MISE_TOOL_INSTALL_PATH/supabase-go\"; do if [ -f \"$binary\" ] && ! /usr/bin/codesign --verify --strict \"$binary\" 2>/dev/null; then /usr/bin/codesign --force --sign - \"$binary\"; fi; done; fi" }
+
+[bootstrap.packages]
+# Deliberately installed tools; mise resolves their native library dependencies.
+"brew:cmatrix" = "latest"
+"brew:exiftool" = "latest"
+"brew:eza" = "latest"
+"brew:ffmpeg" = "latest"
+"brew:fzf" = "latest"
+"brew:git" = "latest"
+"brew:gzip" = "latest"
+"brew:tree" = "latest"
+"brew:wget" = "latest"
+
+"brew-cask:bruno" = { version = "latest", adopt = true }
+"brew-cask:discord" = { version = "latest", adopt = true }
+"brew-cask:github" = { version = "latest", adopt = true }
+"brew-cask:iterm2" = { version = "latest", adopt = true }
+"brew-cask:macs-fan-control" = { version = "latest", adopt = true }
+"brew-cask:postman" = { version = "latest", adopt = true }
+"brew-cask:slack" = { version = "latest", adopt = true }
+"brew-cask:visual-studio-code" = { version = "latest", adopt = true }
+"brew-cask:jalview" = { version = "latest", adopt = true }
+"brew-cask:codexbar" = { version = "latest", adopt = true }
+
+"brew-cask:orbstack" = { version = "latest", adopt = true }
+
+# Additional desktop apps and complete font packages.
+"brew-cask:cursor" = { version = "latest", adopt = true }
+"brew-cask:devin-desktop" = { version = "latest", adopt = true }
+"brew-cask:google-chrome" = { version = "latest", adopt = true }
+"brew-cask:raycast" = { version = "latest", adopt = true }
+"brew-cask:daisydisk" = { version = "latest", adopt = true }
+"brew-cask:devutils" = { version = "latest", adopt = true }
+"brew-cask:opera" = { version = "latest", adopt = true }
+"brew-cask:spotify" = { version = "latest", adopt = true }
+"brew-cask:ledger-wallet" = { version = "latest", adopt = true }
+"brew-cask:chatgpt" = { version = "latest", adopt = true }
+"brew-cask:font-poppins" = { version = "latest", adopt = true }
+
+[bootstrap.services.mise-tool-update]
+builtin = "tool-update"
+
+[bootstrap.packages."macos-app:marktext"]
+version = "0.21.2"
+url = "https://github.com/marktext/marktext/releases/download/v0.21.2/marktext-mac-arm64-0.21.2.dmg"
+sha256 = "6c07b697ba3262e8b130ab3ee85bdc621077cf4035c8cc339098cdb2892142c1"
+artifact = "MarkText.app"
+adopt = true
+os = "macos/arm64"
+
+# Schedule host packages, desktop apps, and mise itself independently of shells.
+[bootstrap.macos.launchd.agents.mise-maintenance]
+program = "~/.local/bin/mise"
+args = ["exec", "--", "python", "{{ env.HOME }}/.config/mise/scripts/maintenance.py"]
+working_directory = "~"
+environment = { PATH = "{{ env.HOME }}/.local/bin:{{ env.HOME }}/.local/share/mise/shims:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/bin:/bin:/usr/sbin:/sbin" }
+run_at_load = true
+start_calendar_interval = { hour = 3, minute = 0 }
+process_type = "Background"
+nice = 10
+stdout_path = "~/Library/Logs/mise-maintenance-agent.log"
+stderr_path = "~/Library/Logs/mise-maintenance-agent.err.log"
+
+[tasks."maintenance:update"]
+description = "Update global tools, host packages, idle apps, shell repositories, and mise"
+dir = "~"
+run = '"$HOME/.local/bin/mise" -C "$HOME" exec -- python "$HOME/.config/mise/scripts/maintenance.py"'
+
+[tasks."maintenance:check"]
+description = "Preview global tool, package, and MarkText updates"
+dir = "~"
+run = '"$HOME/.local/bin/mise" -C "$HOME" exec -- python "$HOME/.config/mise/scripts/maintenance.py" --check'
+
+[tasks."maintenance:status"]
+description = "Show the last automatic or manual maintenance result"
+dir = "~"
+run = '"$HOME/.local/bin/mise" -C "$HOME" exec -- python "$HOME/.config/mise/scripts/maintenance.py" --status'
+
+# Global shell checkouts; update only by fast-forward and preserve local edits.
+[bootstrap.repos]
+"~/.config/mise" = { url = "https://github.com/trevordcampbell/mise-setup.git", ref = "main" }
+"~/.oh-my-zsh" = { url = "https://github.com/ohmyzsh/ohmyzsh.git", ref = "master" }
+"~/.oh-my-zsh/custom/plugins/ls" = { url = "https://github.com/zpm-zsh/ls.git", ref = "master" }
+"~/.oh-my-zsh/custom/plugins/zsh-autosuggestions" = { url = "https://github.com/zsh-users/zsh-autosuggestions", ref = "master" }
+"~/.oh-my-zsh/custom/plugins/zsh-syntax-highlighting" = { url = "https://github.com/zsh-users/zsh-syntax-highlighting.git", ref = "master" }
+"~/.oh-my-zsh/custom/plugins/fzf-tab" = { url = "https://github.com/Aloxaf/fzf-tab", ref = "master" }
+"~/.oh-my-zsh/custom/themes/powerlevel10k" = { url = "https://github.com/romkatv/powerlevel10k.git", ref = "master" }
+
+# Live shell files are links into this global-config checkout.
+[dotfiles]
+"~/Library/Fonts/*.ttf" = { source = "~/.local/share/mise/font-sources/fonts/*.ttf", mode = "copy", permissions = "0644" }
+"~/.zshrc" = { source = "~/.config/mise/dotfiles/.zshrc", mode = "symlink" }
+"~/.zprofile" = { source = "~/.config/mise/dotfiles/.zprofile", mode = "symlink" }
+"~/.p10k.zsh" = { source = "~/.config/mise/dotfiles/.p10k.zsh", mode = "symlink" }
+"~/.fzf.zsh" = { source = "~/.config/mise/dotfiles/.fzf.zsh", mode = "symlink" }
+"~/.fzf.bash" = { source = "~/.config/mise/dotfiles/.fzf.bash", mode = "symlink" }
+"~/.bashrc" = { source = "~/.config/mise/dotfiles/.bashrc", mode = "symlink" }
+
+[tasks."shell:status"]
+description = "Show managed shell repositories and dotfiles"
+dir = "~"
+run = ["mise bootstrap repos status", "mise dotfiles status"]
+
+[tasks."shell:update"]
+description = "Fast-forward clean shell repositories and refresh mise completions"
+dir = "~"
+run = ["mise bootstrap repos update --skip-dirty -y", "mise run shell:completions"]
+
+[tasks."shell:completions"]
+description = "Generate completion for the installed mise version"
+dir = "~"
+run = 'mkdir -p "$HOME/.local/share/zsh/site-functions" && "$HOME/.local/bin/mise" completion zsh > "$HOME/.local/share/zsh/site-functions/_mise"'
+
+[bootstrap.hooks]
+# Install tools before fonts and RunAtLoad update jobs on a fresh machine.
+pre-packages = '"$HOME/.local/bin/mise" -C "$HOME" install'
+final = ['"$HOME/.local/bin/mise" -C "$HOME" run github:credentials', '"$HOME/.local/bin/mise" -C "$HOME" run shell:completions']
+pre-dotfiles = '"$HOME/.local/bin/mise" -C "$HOME" run fonts:sync'
+
+[tasks."fonts:sync"]
+description = "Stage complete official Google variable font families"
+dir = "~"
+run = '"$HOME/.local/bin/mise" -C "$HOME" exec -- python "$HOME/.config/mise/scripts/google-fonts.py"'
+
+[tasks."fonts:check"]
+description = "Preview official variable font updates"
+dir = "~"
+run = '"$HOME/.local/bin/mise" -C "$HOME" exec -- python "$HOME/.config/mise/scripts/google-fonts.py" --check'
+
+[tasks."fonts:update"]
+description = "Update and deploy official Google variable fonts"
+dir = "~"
+run = '"$HOME/.local/bin/mise" -C "$HOME" exec -- python "$HOME/.config/mise/scripts/google-fonts.py" --deploy'
+
+[tasks."github:credentials"]
+description = "Configure stable GitHub credentials and noreply commit email"
+dir = "~"
+run = [
+  'git -C "$HOME/.config/mise" config user.email 55037769+trevordcampbell@users.noreply.github.com',
+  'git config --global credential.https://github.com.helper ""',
+  "git config --global --add credential.https://github.com.helper '!$HOME/.local/share/mise/shims/gh auth git-credential'",
+]
