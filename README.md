@@ -32,7 +32,7 @@ Mise manages the current Python interpreter and `uv@latest`; both join automatic
 
 Use `uv venv` to create an environment, `uv pip install` for packages inside it, `uv sync` / `uv run` for projects already configured for uv, and `uvx` for temporary Python command-line tools. Existing development projects and devcontainers are not converted automatically. For a new environment using the current host Python explicitly, run `uv venv --python "$(mise which python)"`.
 
-The optional terminal tools `cmatrix`, GNU `gzip`, `tree`, and `wget`, the disabled `fzf-tab` checkout, and the Supabase CLI are intentionally excluded. macOS supplies `gzip`, `gunzip`, and `curl`; the shell's `lt` and `lta` aliases use eza for tree views.
+The optional terminal tools `cmatrix`, GNU `gzip`, `tree`, and `wget`, the disabled `fzf-tab` checkout, and the Supabase CLI are intentionally excluded. macOS supplies `gzip`, `gunzip`, and `curl`; the shell's `lt` and `lta` functions use eza for tree views.
 
 Reference: [uv Python discovery and preferences](https://docs.astral.sh/uv/concepts/python-versions/).
 
@@ -55,6 +55,23 @@ mise run shell:update
 mise run fonts:check
 mise run fonts:update
 ```
+
+Manual maintenance shows each stage as it starts and finishes, elapsed time, and a concise summary. Completed stages mean the command succeeded; they do not imply a version changed. Open apps are listed as deferred. Terminal output uses color when supported and honors `NO_COLOR`; scheduled jobs use plain text. Full logs and JSON state reports are always saved locally.
+
+```sh
+# Show the underlying command output live, while also saving the log:
+mise -C "$HOME" run maintenance:update --verbose
+
+# Emit a JSON report on stdout (suitable for redirecting or piping):
+mise -C "$HOME" run maintenance:update --json
+mise -C "$HOME" run maintenance:check --json
+mise -C "$HOME" run maintenance:status --json
+
+# The status command displays the most recent update without running updates:
+mise -C "$HOME" run maintenance:status
+```
+
+`--verbose` and `--json` belong after the task name. They can be combined: the JSON report goes to stdout and command output goes to stderr. Preview mode also accepts `--verbose`, which exposes the underlying update plans. JSON stdout contains no progress messages or log-path trailer; the log path is included in the report. `last-run.json` and `last-check.json` live in `~/.local/state/mise/maintenance/`; command output is kept in `~/Library/Logs/mise-maintenance.log`.
 
 ## Save configuration changes
 

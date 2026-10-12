@@ -84,16 +84,22 @@ stdout_path = "~/Library/Logs/mise-maintenance-agent.log"
 stderr_path = "~/Library/Logs/mise-maintenance-agent.err.log"
 
 [tasks."maintenance:update"]
+output = "interleave"
+quiet = true
 description = "Update global tools, host packages, idle apps, shell repositories, and mise"
 dir = "~"
 run = '"$HOME/.local/bin/mise" -C "$HOME" exec -- python "$HOME/.config/mise/scripts/maintenance.py"'
 
 [tasks."maintenance:check"]
+output = "interleave"
+quiet = true
 description = "Preview global tool, package, and MarkText updates"
 dir = "~"
 run = '"$HOME/.local/bin/mise" -C "$HOME" exec -- python "$HOME/.config/mise/scripts/maintenance.py" --check'
 
 [tasks."maintenance:status"]
+output = "interleave"
+quiet = true
 description = "Show the last automatic or manual maintenance result"
 dir = "~"
 run = '"$HOME/.local/bin/mise" -C "$HOME" exec -- python "$HOME/.config/mise/scripts/maintenance.py" --status'

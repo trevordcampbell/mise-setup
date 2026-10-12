@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
 """Update this Mac's global mise tools, packages, and official MarkText release."""
 import argparse
+import codecs
 from datetime import datetime, timezone, timedelta
 import fcntl
+from functools import partial
 import json
 import os
 from pathlib import Path
 import plistlib
 import re
+import selectors
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 from urllib.request import Request, urlopen
 
@@ -46,14 +51,149 @@ def atomic_write(path, content):
             os.unlink(temp)
 
 
-def run(args, log, timeout=3600):
-    log.write(f'\n[{now()}] {" ".join(map(str, args))}\n')
+def label(name):
+    labels = {
+        'mise': 'Mise', 'tools': 'Global tools', 'rustup': 'Rustup',
+        'shell-repositories': 'Configuration and shell repositories',
+        'shell-completions': 'Shell completions', 'variable-fonts': 'Variable fonts',
+        'marktext': 'MarkText', 'brew': 'Native packages',
+        'visual-studio-code': 'Visual Studio Code', 'google-chrome': 'Google Chrome',
+        'github': 'GitHub Desktop', 'iterm2': 'iTerm2', 'orbstack': 'OrbStack',
+        'chatgpt': 'ChatGPT', 'codexbar': 'CodexBar', 'daisydisk': 'DaisyDisk',
+        'devutils': 'DevUtils', 'macs-fan-control': 'Macs Fan Control',
+        'font-poppins': 'Poppins fonts',
+    }
+    name = name.removeprefix('brew-cask:')
+    return labels.get(name, name.replace('-', ' ').title())
+
+
+def outcome(result):
+    state = result['state']
+    if state == 'failed':
+        return '✗', result.get('error', 'Failed'), '31'
+    if state == 'deferred-running-app':
+        return '↷', 'Deferred — app is running', '33'
+    if state == 'update-available':
+        return '↑', f"Update available: {result.get('installed', '?')} → {result.get('available', '?')}", '33'
+    if state == 'updated':
+        return '✓', f"Updated to {result.get('installed', '?')}", '32'
+    if state == 'current':
+        return '✓', f"Current ({result.get('installed', '?')})", '32'
+    if state == 'not-configured':
+        return '–', 'Not configured', '33'
+    # A successful command may check or install; do not claim a version changed.
+    return '✓', 'Check completed' if state == 'checked' else 'Completed', '32'
+
+
+class Console:
+    def __init__(self, *, verbose=False, json_output=False):
+        self.verbose = verbose
+        self.json_output = json_output
+        self.stdout = sys.stdout
+        self.stderr = sys.stderr
+        self.color = self.stdout.isatty() and os.environ.get('TERM') != 'dumb' and 'NO_COLOR' not in os.environ
+
+    def paint(self, text, code):
+        return f'\033[{code}m{text}\033[0m' if self.color else text
+
+    def say(self, text=''):
+        if not self.json_output:
+            print(text, file=self.stdout, flush=True)
+
+    def starting(self, name, check_only):
+        self.say(f"… {'Checking' if check_only else 'Processing'} {label(name)}…")
+
+    def finished(self, name, result):
+        symbol, detail, color = outcome(result)
+        elapsed = f"  {result['elapsed_seconds']:.1f}s" if 'elapsed_seconds' in result else ''
+        self.say(f"{self.paint(symbol, color)} {label(name)}: {detail}{elapsed}")
+
+    def summary(self, report, *, show_steps=False):
+        if self.json_output:
+            print(json.dumps(report, indent=2), file=self.stdout, flush=True)
+            return
+        if report['state'] == 'not-run-yet':
+            self.say('No maintenance run has been recorded yet.')
+            return
+        if report['state'] == 'already-running':
+            self.say('Another maintenance run is active; skipped.')
+            return
+        if show_steps:
+            self.say(f"Last maintenance run: {report.get('started_at', 'unknown')}")
+            for name, result in report.get('results', {}).items():
+                self.finished(name, result)
+        results = report.get('results', {})
+        failed = [name for name, result in results.items() if result['state'] == 'failed']
+        deferred = [name for name, result in results.items() if result['state'] == 'deferred-running-app']
+        available = [name for name, result in results.items() if result['state'] == 'update-available']
+        completed = sum(result['state'] in ('success', 'checked', 'current', 'updated') for result in results.values())
+        elapsed = report.get('elapsed_seconds')
+        if elapsed is None and report.get('finished_at') and report.get('started_at'):
+            elapsed = (datetime.fromisoformat(report['finished_at']) - datetime.fromisoformat(report['started_at'])).total_seconds()
+        duration = f' in {elapsed:.1f}s' if elapsed is not None else ''
+        preview = 'Preview' if report.get('check_only') else 'Maintenance'
+        good = report['state'] == 'success'
+        self.say()
+        self.say(self.paint(f"{'✓' if good else '✗'} {preview} {'completed' if good else 'finished with errors'}{duration}", '32' if good else '31'))
+        error_label = "error" if len(failed) == 1 else "errors"
+        self.say(f"  {completed} stages completed · {len(failed)} {error_label} · {len(deferred)} deferred")
+        if deferred:
+            self.say('  Deferred: ' + ', '.join(map(label, deferred)) + ' — close these apps and retry, or wait for a later run.')
+        if available:
+            self.say('  Updates available: ' + ', '.join(map(label, available)))
+        if failed and not show_steps:
+            for name in failed:
+                self.say(f"  {label(name)}: {results[name].get('error', 'Failed')}")
+        self.say(f"  Detailed log: {report.get('log', str(LOG))}")
+
+
+def run(args, log, timeout=3600, console=None):
+    command = list(map(str, args))
+    log.write(f'\n[{now()}] {" ".join(command)}\n')
     log.flush()
-    result = subprocess.run(list(map(str, args)), cwd=HOME, env=ENV,
-                            stdin=subprocess.DEVNULL, stdout=log,
-                            stderr=subprocess.STDOUT, timeout=timeout)
-    if result.returncode:
-        raise RuntimeError(f'Command exited {result.returncode}: {" ".join(map(str, args))}')
+    if console is None or not console.verbose:
+        result = subprocess.run(command, cwd=HOME, env=ENV,
+                                stdin=subprocess.DEVNULL, stdout=log,
+                                stderr=subprocess.STDOUT, timeout=timeout)
+        returncode = result.returncode
+    else:
+        # Stream to the terminal and keep the full log. A pipe avoids ANSI progress
+        # controls in the saved log; selectors also handle output without newlines.
+        print('$ ' + ' '.join(command), file=console.stderr, flush=True)
+        deadline = time.monotonic() + timeout
+        decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
+        with subprocess.Popen(command, cwd=HOME, env=ENV, stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              start_new_session=True) as process:
+            try:
+                with selectors.DefaultSelector() as selector:
+                    selector.register(process.stdout, selectors.EVENT_READ)
+                    while selector.get_map():
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise subprocess.TimeoutExpired(command, timeout)
+                        for key, _ in selector.select(min(remaining, 0.2)):
+                            chunk = os.read(key.fileobj.fileno(), 65536)
+                            if not chunk:
+                                selector.unregister(key.fileobj)
+                            text = decoder.decode(chunk, final=not chunk)
+                            log.write(text)
+                            log.flush()
+                            console.stderr.write(text)
+                            console.stderr.flush()
+                    remaining = deadline - time.monotonic()
+                    returncode = process.wait(timeout=max(remaining, 0))
+            except BaseException:
+                # A timed-out or interrupted command must not continue updating
+                # in the background, including children holding the output pipe.
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait()
+                raise
+    if returncode:
+        raise RuntimeError(f'Command exited {returncode}: {" ".join(command)}')
 
 
 def is_running(app):
@@ -88,7 +228,8 @@ def release_version(value):
     return tuple(map(int, match.groups()))
 
 
-def marktext(check_only, log):
+def marktext(check_only, log, console=None):
+    command = partial(run, console=console)
     key = 'macos-app:marktext'
     config = tomllib.loads(CONFIG.read_text())
     entry = config['bootstrap']['packages'].get(key)
@@ -126,7 +267,7 @@ def marktext(check_only, log):
         installed = plistlib.load(source)['CFBundleShortVersionString']
     if release_version(version) <= release_version(installed):
         if not check_only:
-            run(['/usr/bin/codesign', '--verify', '--strict', str(app)], log, timeout=120)
+            command(['/usr/bin/codesign', '--verify', '--strict', str(app)], log, timeout=120)
         return {'state': 'current', 'installed': installed, 'eligible_release': version}
     url = asset['browser_download_url']
     expected_url = f'https://github.com/marktext/marktext/releases/download/{tag}/{asset["name"]}'
@@ -154,8 +295,8 @@ def marktext(check_only, log):
     atomic_write(STATE / 'config-before-marktext-update.toml', before)
     atomic_write(CONFIG, after)
     try:
-        run([MISE, 'bootstrap', 'packages', 'apply', key, '-y'], log)
-        run(['/usr/bin/codesign', '--verify', '--strict', str(app)], log, timeout=120)
+        command([MISE, 'bootstrap', 'packages', 'apply', key, '-y'], log)
+        command(['/usr/bin/codesign', '--verify', '--strict', str(app)], log, timeout=120)
         with (app / 'Contents/Info.plist').open('rb') as source:
             actual = plistlib.load(source)['CFBundleShortVersionString']
         if actual != version:
@@ -170,28 +311,37 @@ def marktext(check_only, log):
     return {'state': 'updated', 'installed': version, 'sha256': digest[7:]}
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--check', action='store_true', help='Preview updates without applying them')
     parser.add_argument('--status', action='store_true', help='Print the most recent scheduled/manual run')
-    args = parser.parse_args()
+    parser.add_argument('--verbose', action='store_true', help='Stream command output as well as saving the log')
+    parser.add_argument('--json', action='store_true', dest='json_output', help='Print only the structured report on stdout')
+    args = parser.parse_args(argv)
+    console = Console(verbose=args.verbose, json_output=args.json_output)
+    command = partial(run, console=console)
     if args.status:
         path = STATE / 'last-run.json'
-        print(path.read_text() if path.exists() else '{"state":"not-run-yet"}')
+        console.summary(json.loads(path.read_text()) if path.exists() else {'state': 'not-run-yet'}, show_steps=True)
         return 0
     STATE.mkdir(parents=True, exist_ok=True)
     with (STATE / 'update.lock').open('a') as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            print('Another maintenance run is active; skipped.')
+            console.summary({'state': 'already-running'})
             return 0
         LOG.parent.mkdir(parents=True, exist_ok=True)
         if LOG.exists() and LOG.stat().st_size > 5_000_000:
             os.replace(LOG, LOG.with_suffix('.previous.log'))
-        report = {'started_at': now(), 'check_only': args.check, 'results': {}, 'errors': []}
+        started = time.monotonic()
+        report = {'started_at': now(), 'check_only': args.check, 'results': {}, 'errors': [], 'log': str(LOG)}
+        console.say('Previewing maintenance updates' if args.check else 'Running maintenance updates')
+        console.say()
         with LOG.open('a', buffering=1) as log:
             def step(name, action):
+                console.starting(name, args.check)
+                stage_started = time.monotonic()
                 try:
                     result = action()
                     report['results'][name] = result or {'state': 'success'}
@@ -199,38 +349,41 @@ def main():
                     report['results'][name] = {'state': 'failed', 'error': str(error)}
                     report['errors'].append(name)
                     log.write(f'[{now()}] {name}: {error}\n')
+                report['results'][name]['elapsed_seconds'] = round(time.monotonic() - stage_started, 3)
+                console.finished(name, report['results'][name])
             if not args.check:
-                step('mise', lambda: run([MISE, 'self-update', '-y', '--no-plugins'], log, timeout=600))
-            step('tools', lambda: run([MISE, 'upgrade', '--global', '-y'] + (['--dry-run'] if args.check else []), log))
+                step('mise', lambda: command([MISE, 'self-update', '-y', '--no-plugins'], log, timeout=600))
+            step('tools', lambda: command([MISE, 'upgrade', '--global', '-y'] + (['--dry-run'] if args.check else []), log))
             if 'rust' in tomllib.loads(CONFIG.read_text()).get('tools', {}):
-                step('rustup', lambda: run([HOME / '.cargo/bin/rustup', 'check'] if args.check else [HOME / '.cargo/bin/rustup', 'self', 'update'], log, timeout=600))
-            step('shell-repositories', lambda: run([MISE, 'bootstrap', 'repos', 'update', '--skip-dirty', '-y'] + (['--dry-run'] if args.check else []), log, timeout=600))
+                step('rustup', lambda: command([HOME / '.cargo/bin/rustup', 'check'] if args.check else [HOME / '.cargo/bin/rustup', 'self', 'update'], log, timeout=600))
+            step('shell-repositories', lambda: command([MISE, 'bootstrap', 'repos', 'update', '--skip-dirty', '-y'] + (['--dry-run'] if args.check else []), log, timeout=600))
             if not args.check:
-                step('shell-completions', lambda: run([MISE, 'run', 'shell:completions'], log, timeout=120))
-            step('variable-fonts', lambda: run([MISE, 'run', 'fonts:check' if args.check else 'fonts:update'], log, timeout=300))
-            step('marktext', lambda: marktext(args.check, log))
+                step('shell-completions', lambda: command([MISE, 'run', 'shell:completions'], log, timeout=120))
+            step('variable-fonts', lambda: command([MISE, 'run', 'fonts:check' if args.check else 'fonts:update'], log, timeout=300))
+            step('marktext', lambda: marktext(args.check, log, console=console))
             packages = tomllib.loads(CONFIG.read_text())['bootstrap']['packages']
             for key in packages:
                 if key.startswith('macos-app:') and key != 'macos-app:marktext':
-                    report['results'][key] = {'state': 'failed', 'error': 'Direct app downloads require a release resolver; prefer brew-cask when available'}
-                    report['errors'].append(key)
+                    def unsupported_app():
+                        raise RuntimeError('Direct app downloads require a release resolver; prefer brew-cask when available')
+                    step(key, unsupported_app)
             managers = sorted({key.split(':', 1)[0] for key in packages} - {'brew-cask', 'macos-app'})
             for manager in managers:
-                step(manager, lambda m=manager: run([MISE, 'bootstrap', 'packages', 'upgrade', '--manager', m, '-y'] + (['--dry-run'] if args.check else []), log))
+                step(manager, lambda m=manager: command([MISE, 'bootstrap', 'packages', 'upgrade', '--manager', m, '-y'] + (['--dry-run'] if args.check else []), log))
             for key in packages:
                 if not key.startswith('brew-cask:'):
                     continue
                 def cask_update(k=key):
                     if not args.check and any(is_running(app) for app in cask_apps(k.split(':', 1)[1])):
                         return {'state': 'deferred-running-app'}
-                    run([MISE, 'bootstrap', 'packages', 'upgrade', k, '-y'] + (['--dry-run'] if args.check else []), log)
+                    command([MISE, 'bootstrap', 'packages', 'upgrade', k, '-y'] + (['--dry-run'] if args.check else []), log)
                     return {'state': 'checked' if args.check else 'success'}
                 step(key, cask_update)
             report['finished_at'] = now()
+            report['elapsed_seconds'] = round(time.monotonic() - started, 3)
             report['state'] = 'failed' if report['errors'] else 'success'
             atomic_write(STATE / ('last-check.json' if args.check else 'last-run.json'), json.dumps(report, indent=2) + '\n')
-            print(json.dumps(report, indent=2))
-            print(f'Detailed log: {LOG}')
+            console.summary(report)
             return 1 if report['errors'] else 0
 
 
