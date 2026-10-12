@@ -9,6 +9,10 @@ self_update.auto = true
 self_update.check_duration = "24h"
 minimum_release_age = "24h"
 
+[env]
+# Prefer the Python interpreter supplied by mise when uv creates environments.
+UV_PYTHON_PREFERENCE = "system"
+
 [tools]
 node = "latest"
 python = "latest"
@@ -19,20 +23,15 @@ pnpm = "latest"
 gh = "latest"
 "cargo:zpl_toolchain_cli" = "latest"
 "github:skw398/scap" = { version = "latest", asset_pattern = "scap.zip" }
-# Repair invalid ad-hoc signatures in verified Supabase release artifacts on macOS.
-supabase = { version = "latest", postinstall = "if [ \"$(uname -s)\" = Darwin ]; then for binary in \"$MISE_TOOL_INSTALL_PATH/supabase\" \"$MISE_TOOL_INSTALL_PATH/supabase-go\"; do if [ -f \"$binary\" ] && ! /usr/bin/codesign --verify --strict \"$binary\" 2>/dev/null; then /usr/bin/codesign --force --sign - \"$binary\"; fi; done; fi" }
+uv = "latest"
 
 [bootstrap.packages]
 # Deliberately installed tools; mise resolves their native library dependencies.
-"brew:cmatrix" = "latest"
 "brew:exiftool" = "latest"
 "brew:eza" = "latest"
 "brew:ffmpeg" = "latest"
 "brew:fzf" = "latest"
 "brew:git" = "latest"
-"brew:gzip" = "latest"
-"brew:tree" = "latest"
-"brew:wget" = "latest"
 
 "brew-cask:bruno" = { version = "latest", adopt = true }
 "brew-cask:discord" = { version = "latest", adopt = true }
@@ -106,7 +105,6 @@ run = '"$HOME/.local/bin/mise" -C "$HOME" exec -- python "$HOME/.config/mise/scr
 "~/.oh-my-zsh/custom/plugins/ls" = { url = "https://github.com/zpm-zsh/ls.git", ref = "master" }
 "~/.oh-my-zsh/custom/plugins/zsh-autosuggestions" = { url = "https://github.com/zsh-users/zsh-autosuggestions", ref = "master" }
 "~/.oh-my-zsh/custom/plugins/zsh-syntax-highlighting" = { url = "https://github.com/zsh-users/zsh-syntax-highlighting.git", ref = "master" }
-"~/.oh-my-zsh/custom/plugins/fzf-tab" = { url = "https://github.com/Aloxaf/fzf-tab", ref = "master" }
 "~/.oh-my-zsh/custom/themes/powerlevel10k" = { url = "https://github.com/romkatv/powerlevel10k.git", ref = "master" }
 
 # Live shell files are links into this global-config checkout.

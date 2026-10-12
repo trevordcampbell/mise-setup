@@ -2,7 +2,7 @@
 
 Reproducible host setup for an Apple Silicon Mac. This repository is the live global mise configuration at `~/.config/mise`. Development projects continue to use their devcontainers.
 
-`config.toml` declares nine tools, nine native command-line packages, 21 desktop app casks, Poppins, MarkText, shell repositories, managed shell files, Google variable fonts, and automatic update jobs. Native packages use mise's built-in `brew` and `brew-cask` backends; a Homebrew installation or executable is not required. Native libraries are resolved automatically.
+`config.toml` declares nine tools, five native command-line packages, 21 desktop app casks, Poppins, MarkText, shell repositories, managed shell files, Google variable fonts, and automatic update jobs. Native packages use mise's built-in `brew` and `brew-cask` backends; a Homebrew installation or executable is not required. Native libraries are resolved automatically.
 
 ## Restore on a new Mac
 
@@ -25,6 +25,16 @@ Reproducible host setup for an Apple Silicon Mac. This repository is the live gl
 Mise must live at `~/.local/bin/mise`, because the update jobs use that stable path. Initial native package setup may ask for administrator authentication to create `/opt/homebrew`. Tools are installed before the font hook and update jobs need them; the final bootstrap hook generates shell completions and configures a stable GitHub credential helper that survives gh upgrades.
 
 This manifest targets macOS ARM64, not a Linux server or Intel Mac. App logins, licenses, preferences, terminal font selection, documents, OrbStack containers, and application databases still need their own restore or sign-in. App Store applications, Zoom, RODE Central, licensed vendor applications, and macOS system applications are outside this manifest. No project configurations, APFS volumes, or Time Machine settings are changed.
+
+## Python and uv
+
+Mise manages the current Python interpreter and `uv@latest`; both join automatic tool updates. Pyenv is not installed. `UV_PYTHON_PREFERENCE=system` makes uv prefer Python already supplied by Mise. A project that explicitly requires another Python version can still ask uv to download it when needed.
+
+Use `uv venv` to create an environment, `uv pip install` for packages inside it, `uv sync` / `uv run` for projects already configured for uv, and `uvx` for temporary Python command-line tools. Existing development projects and devcontainers are not converted automatically. For a new environment using the current host Python explicitly, run `uv venv --python "$(mise which python)"`.
+
+The optional terminal tools `cmatrix`, GNU `gzip`, `tree`, and `wget`, the disabled `fzf-tab` checkout, and the Supabase CLI are intentionally excluded. macOS supplies `gzip`, `gunzip`, and `curl`; the shell's `lt` and `lta` aliases use eza for tree views.
+
+Reference: [uv Python discovery and preferences](https://docs.astral.sh/uv/concepts/python-versions/).
 
 Official references: [install mise](https://mise.jdx.dev/installing-mise.html), [bootstrap](https://mise.jdx.dev/bootstrap.html), and [adopt a global configuration repository](https://mise.jdx.dev/bootstrap/from-repository.html).
 
