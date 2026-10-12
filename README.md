@@ -56,10 +56,16 @@ mise run fonts:check
 mise run fonts:update
 ```
 
-Manual maintenance shows each stage as it starts and finishes, elapsed time, and a concise summary. Completed stages mean the command succeeded; they do not imply a version changed. Open apps are listed as deferred. Terminal output uses color when supported and honors `NO_COLOR`; scheduled jobs use plain text. Full logs and JSON state reports are always saved locally.
+Manual maintenance uses one animated progress line in a terminal, followed by a summary of actual installed changes, deferred apps, skipped items, and errors. Unchanged checks do not scroll past. Redirected output and scheduled jobs use a compact plain-text summary; terminal color honors `NO_COLOR`.
+
+The updater compares installed state before and after each stage: Mise and global tool versions, app versions/builds, all linked native package/dependency versions, repository commits, deployed font contents, and shell completion contents. It groups changed font styles by family and shows shortened commit/build hashes in the terminal. Full values and both state snapshots stay in the JSON report. Source-revision bookkeeping alone does not count as a font update. Shell completion regeneration is reported separately, even when its content stays identical.
+
+Failed stages retain any observed partial changes. Missing or unreadable state is reported as unverified, never as unchanged. A skipped running app means its update check was deferred; it does not imply an update is available. Snapshots describe observed changes during the stage; a vendor or another updater acting concurrently can also change installed state. Clean repository updates fast-forward; dirty repositories are explicitly listed as preserved.
+
+Preview mode applies no updates. It uses Mise's structured `outdated` output for global tools, the font helper's structured plan, and native package-manager dry-run plans. Available versions are separate from installed changes. Native plan formats that cannot be interpreted are flagged, with their full output kept in the log. MarkText retains its verified release resolver. Full command logs and JSON state reports are always saved locally.
 
 ```sh
-# Show the underlying command output live, while also saving the log:
+# Show every stage and underlying command output live, while also saving the log:
 mise -C "$HOME" run maintenance:update --verbose
 
 # Emit a JSON report on stdout (suitable for redirecting or piping):
@@ -71,7 +77,7 @@ mise -C "$HOME" run maintenance:status --json
 mise -C "$HOME" run maintenance:status
 ```
 
-`--verbose` and `--json` belong after the task name. They can be combined: the JSON report goes to stdout and command output goes to stderr. Preview mode also accepts `--verbose`, which exposes the underlying update plans. JSON stdout contains no progress messages or log-path trailer; the log path is included in the report. `last-run.json` and `last-check.json` live in `~/.local/state/mise/maintenance/`; command output is kept in `~/Library/Logs/mise-maintenance.log`.
+`--verbose` and `--json` belong after the task name. They can be combined: the JSON report goes to stdout and command output goes to stderr. `changes` lists observed installed changes, `planned_changes` lists available updates, and each stage retains its `before`/`after` snapshots and any verification errors. Reports include `schema_version` of `2`; older reports are displayed without inventing change details. Preview mode also accepts `--verbose`, which exposes the underlying update plans. JSON stdout contains no progress messages or log-path trailer; the log path is included in the report. `last-run.json` and `last-check.json` live in `~/.local/state/mise/maintenance/`; command output is kept in `~/Library/Logs/mise-maintenance.log`.
 
 ## Save configuration changes
 
