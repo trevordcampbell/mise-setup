@@ -27,7 +27,6 @@ uv = "latest"
 
 [bootstrap.packages]
 # Deliberately installed tools; mise resolves their native library dependencies.
-"brew:exiftool" = "latest"
 "brew:eza" = "latest"
 "brew:ffmpeg" = "latest"
 "brew:fzf" = "latest"
@@ -41,7 +40,6 @@ uv = "latest"
 "brew-cask:postman" = { version = "latest", adopt = true }
 "brew-cask:slack" = { version = "latest", adopt = true }
 "brew-cask:visual-studio-code" = { version = "latest", adopt = true }
-"brew-cask:jalview" = { version = "latest", adopt = true }
 "brew-cask:codexbar" = { version = "latest", adopt = true }
 
 "brew-cask:orbstack" = { version = "latest", adopt = true }
@@ -50,7 +48,6 @@ uv = "latest"
 "brew-cask:cursor" = { version = "latest", adopt = true }
 "brew-cask:devin-desktop" = { version = "latest", adopt = true }
 "brew-cask:google-chrome" = { version = "latest", adopt = true }
-"brew-cask:raycast" = { version = "latest", adopt = true }
 "brew-cask:daisydisk" = { version = "latest", adopt = true }
 "brew-cask:devutils" = { version = "latest", adopt = true }
 "brew-cask:opera" = { version = "latest", adopt = true }
