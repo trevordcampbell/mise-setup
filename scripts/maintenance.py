@@ -27,6 +27,7 @@ CONFIG = HOME / '.config/mise/config.toml'
 MISE = HOME / '.local/bin/mise'
 STATE = HOME / '.local/state/mise/maintenance'
 LOG = HOME / 'Library/Logs/mise-maintenance.log'
+APPLICATIONS = Path('/Applications')
 ENV = dict(os.environ, PATH=f'{HOME}/.local/bin:{HOME}/.local/share/mise/shims:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/bin:/bin:/usr/sbin:/sbin', MISE_YES='1')
 # Machine maintenance must never inherit a project's config or version overrides.
 for key in list(ENV):
@@ -59,7 +60,7 @@ def label(name):
         'mise': 'Mise', 'tools': 'Global tools', 'rustup': 'Rustup',
         'shell-repositories': 'Configuration and shell repositories',
         'shell-completions': 'Shell completions', 'variable-fonts': 'Variable fonts',
-        'marktext': 'MarkText', 'brew': 'Native packages',
+        'marktext': 'MarkText', 'brew': 'Native packages', 'setup': 'Declared setup',
         'visual-studio-code': 'Visual Studio Code', 'google-chrome': 'Google Chrome',
         'github': 'GitHub Desktop', 'iterm2': 'iTerm2', 'orbstack': 'OrbStack',
         'chatgpt': 'ChatGPT', 'codexbar': 'CodexBar', 'daisydisk': 'DaisyDisk',
@@ -103,6 +104,8 @@ def outcome(result):
         return '✓', '; '.join(format_change(c) for c in result['changes']), '32'
     if result.get('plans'):
         return '↑', '; '.join(format_change(c, planned=True) for c in result['plans']), '33'
+    if state == 'availability-unknown':
+        return '!', 'Update availability unverified', '33'
     if result.get('observation_errors'):
         return '!', 'Completed; change verification unavailable', '33'
     if state == 'update-available':
@@ -123,8 +126,8 @@ class Console:
     def paint(self, text, code):
         return f'\033[{code}m{text}\033[0m' if self.color else text
 
-    def say(self, text=''):
-        if not self.json_output:
+    def say(self, text='', force=False):
+        if force or not self.json_output:
             print(text, file=self.stdout, flush=True)
 
     def starting(self, name, check_only):
@@ -188,7 +191,7 @@ class Console:
         results = report.get('results', {})
         failed = [name for name, r in results.items() if r['state'] in ('failed', 'interrupted')]
         deferred = [name for name, r in results.items() if r['state'] == 'deferred-running-app']
-        unverified = [name for name, r in results.items() if r.get('observation_errors') or r.get('plan_unverified')]
+        unverified = [name for name, r in results.items() if r.get('observation_errors') or r.get('plan_unverified') or r.get('state') == 'availability-unknown']
         changes = report.get('changes', [])
         plans = report.get('planned_changes', [])
         notes = [(name, note) for name, r in results.items() for note in r.get('notes', [])]
@@ -223,6 +226,11 @@ class Console:
             self.say('No changes applied — preview only.')
         else:
             self.say('No installed versions or contents changed.')
+        if report.get('since_previous_run'):
+            self.say()
+            self.say(self.paint('Changed since the previous run (outside this run)', '1'))
+            for change in report['since_previous_run']:
+                self.say('  ' + format_change(change))
         if plans:
             self.say()
             self.say(self.paint('Updates available (not applied)', '1'))
@@ -237,7 +245,9 @@ class Console:
         if deferred:
             self.say()
             self.say(self.paint('Deferred while running', '33'))
-            self.say('  ' + ' · '.join(map(label, deferred)))
+            for name in deferred:
+                count = results[name].get('consecutive_deferrals', 1)
+                self.say(f"  {label(name)}: update pending — close and retry" + (f' ({count} consecutive runs)' if count > 1 else ''))
         if notes:
             self.say()
             self.say(self.paint('Skipped or noted', '33'))
@@ -259,12 +269,12 @@ class Console:
         self.say(self.paint(f"Detailed log: {report.get('log', str(LOG))}", '2'))
 
 
-def run(args, log, timeout=3600, console=None):
+def run(args, log, timeout=3600, console=None, env=None):
     command = list(map(str, args))
     log.write(f'\n[{now()}] {" ".join(command)}\n')
     log.flush()
     if console is None or not console.verbose:
-        result = subprocess.run(command, cwd=HOME, env=ENV,
+        result = subprocess.run(command, cwd=HOME, env=env or ENV,
                                 stdin=subprocess.DEVNULL, stdout=log,
                                 stderr=subprocess.STDOUT, timeout=timeout)
         returncode = result.returncode
@@ -274,7 +284,7 @@ def run(args, log, timeout=3600, console=None):
         print('$ ' + ' '.join(command), file=console.stderr, flush=True)
         deadline = time.monotonic() + timeout
         decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
-        with subprocess.Popen(command, cwd=HOME, env=ENV, stdin=subprocess.DEVNULL,
+        with subprocess.Popen(command, cwd=HOME, env=env or ENV, stdin=subprocess.DEVNULL,
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                               start_new_session=True) as process:
             try:
@@ -344,7 +354,9 @@ def marktext(check_only, log, console=None):
     command = partial(run, console=console)
     key = 'macos-app:marktext'
     config = tomllib.loads(CONFIG.read_text())
-    entry = config['bootstrap']['packages'].get(key)
+    entry = {'artifact': config.get('vars', {}).get('marktext_artifact')}
+    if not entry['artifact']:
+        entry = config.get('bootstrap', {}).get('packages', {}).get(key)
     if not entry:
         return {'state': 'not-configured'}
     releases = json_url('https://api.github.com/repos/marktext/marktext/releases?per_page=30')
@@ -374,13 +386,9 @@ def marktext(check_only, log, console=None):
     _, version, tag, asset = max(candidates, key=lambda item: item[0])
     if missing_artifacts and max(missing_artifacts)[0] > release_version(version):
         raise RuntimeError(f'Newer MarkText {max(missing_artifacts)[1]} has no expected Apple Silicon DMG; review its release assets')
-    app = Path('/Applications') / entry['artifact']
-    with (app / 'Contents/Info.plist').open('rb') as source:
-        installed = plistlib.load(source)['CFBundleShortVersionString']
-    if release_version(version) <= release_version(installed):
-        if not check_only:
-            command(['/usr/bin/codesign', '--verify', '--strict', str(app)], log, timeout=120)
-        return {'state': 'current', 'installed': installed, 'eligible_release': version}
+    app = APPLICATIONS / entry['artifact']
+    info = app / 'Contents/Info.plist'
+    installed = plistlib.loads(info.read_bytes())['CFBundleShortVersionString'] if info.exists() else None
     url = asset['browser_download_url']
     expected_url = f'https://github.com/marktext/marktext/releases/download/{tag}/{asset["name"]}'
     if url != expected_url:
@@ -388,39 +396,45 @@ def marktext(check_only, log, console=None):
     digest = asset.get('digest', '')
     if not re.fullmatch(r'sha256:[0-9a-f]{64}', digest or ''):
         raise RuntimeError('Official MarkText artifact has no valid SHA-256 digest; update deferred')
+    if installed and release_version(version) <= release_version(installed):
+        if not check_only:
+            command(['/usr/bin/codesign', '--verify', '--strict', str(app)], log, timeout=120)
+        if not check_only:
+            resolved = {'version': version, 'url': url, 'sha256': digest[7:], 'artifact': entry['artifact'], 'adopt': True, 'os': 'macos/arm64'}
+            generated_marktext(resolved)
+            atomic_write(STATE / 'marktext/release.json', json.dumps(dict(resolved, installed=installed, verified_at=now()), indent=2) + '\n')
+        return {'state': 'current', 'installed': installed, 'eligible_release': version}
     if check_only:
         return {'state': 'update-available', 'installed': installed, 'available': version}
     if is_running(app):
         return {'state': 'deferred-running-app', 'installed': installed, 'available': version}
-    before = CONFIG.read_text()
-    pattern = r'(?ms)^\[bootstrap\.packages\."macos-app:marktext"\]\n.*?(?=^\[|\Z)'
-    found = re.search(pattern, before)
-    if not found:
-        raise RuntimeError('Cannot locate the MarkText config section safely')
-    block = found.group()
-    for field, value in {'version': version, 'url': url, 'sha256': digest[7:]}.items():
-        block, count = re.subn(rf'(?m)^{field}\s*=.*$', field + ' = ' + json.dumps(value), block)
-        if count != 1:
-            raise RuntimeError(f'Cannot safely replace MarkText {field}')
-    after = before[:found.start()] + block + before[found.end():]
-    tomllib.loads(after)
-    atomic_write(STATE / 'config-before-marktext-update.toml', before)
-    atomic_write(CONFIG, after)
-    try:
-        command([MISE, 'bootstrap', 'packages', 'apply', key, '-y'], log)
-        command(['/usr/bin/codesign', '--verify', '--strict', str(app)], log, timeout=120)
-        with (app / 'Contents/Info.plist').open('rb') as source:
-            actual = plistlib.load(source)['CFBundleShortVersionString']
-        if actual != version:
-            raise RuntimeError(f'MarkText reports {actual}, expected {version}')
-    except Exception:
-        # Preserve unrelated concurrent edits rather than overwriting them.
-        with (app / 'Contents/Info.plist').open('rb') as source:
-            actual = plistlib.load(source)['CFBundleShortVersionString']
-        if actual != version and CONFIG.read_text() == after:
-            atomic_write(CONFIG, before)
-        raise
+    # The immutable manifest describes the resolver; machine release metadata
+    # lives outside Git. A separate invocation reads this isolated config, so a
+    # fresh bootstrap never applies stale release fields cached by its parent.
+    resolved = {'version': version, 'url': url, 'sha256': digest[7:],
+                'artifact': entry['artifact'], 'adopt': True, 'os': 'macos/arm64'}
+    isolated = generated_marktext(resolved)
+    command([MISE, 'bootstrap', 'packages', 'apply', key, '-y'], log, env=isolated)
+    command(['/usr/bin/codesign', '--verify', '--strict', str(app)], log, timeout=120)
+    actual = plistlib.loads(info.read_bytes())['CFBundleShortVersionString']
+    if actual != version:
+        raise RuntimeError(f'MarkText reports {actual}, expected {version}')
+    atomic_write(STATE / 'marktext/release.json', json.dumps(dict(resolved, verified_at=now()), indent=2) + '\n')
     return {'state': 'updated', 'installed': version, 'sha256': digest[7:]}
+
+
+def generated_marktext(resolved):
+    config_dir = STATE / 'marktext'
+    generated = config_dir / 'config.toml'
+    text = '[bootstrap.packages."macos-app:marktext"]\n' + ''.join(
+        f'{key} = {json.dumps(value)}\n' for key, value in resolved.items())
+    tomllib.loads(text)
+    atomic_write(generated, text)
+    return dict(ENV, MISE_CONFIG_DIR=str(config_dir),
+                MISE_GLOBAL_CONFIG_FILE=str(generated),
+                MISE_SYSTEM_CONFIG_FILE=str(config_dir / 'absent-system.toml'),
+                MISE_OVERRIDE_CONFIG_FILENAMES='__no_project_config__.toml',
+                MISE_OVERRIDE_TOOL_VERSIONS_FILENAMES='__no_tool_versions__')
 
 
 # Installed-state observers are read-only and avoid network metadata refreshes.
@@ -446,6 +460,8 @@ def entity(name, value, kind='version', **details):
 
 def snapshot(name):
     config = tomllib.loads(CONFIG.read_text())
+    if name == 'setup':
+        return inventory()[0]
     if name == 'mise':
         return {'mise': entity('Mise', read_command([MISE, '--version']).split()[0])}
     if name == 'rustup':
@@ -487,8 +503,8 @@ def snapshot(name):
             raise RuntimeError('No installed variable fonts could be inspected')
         return result
     if name == 'marktext':
-        artifact = config['bootstrap']['packages'].get('macos-app:marktext', {}).get('artifact')
-        return app_snapshot(Path('/Applications') / artifact, 'MarkText') if artifact else {}
+        artifact = config.get('vars', {}).get('marktext_artifact') or config.get('bootstrap', {}).get('packages', {}).get('macos-app:marktext', {}).get('artifact')
+        return app_snapshot(APPLICATIONS / artifact, 'MarkText') if artifact else {}
     if name.startswith('brew-cask:'):
         receipts = list((PREFIX / 'Caskroom' / name.split(':', 1)[1]).glob('*/.mise-cask.toml'))
         if not receipts:
@@ -585,15 +601,190 @@ def preview_result(name, text, before):
     return {}
 
 
+
+def inventory():
+    """Observed host state; failures remain explicit and never imply removal."""
+    config = tomllib.loads(CONFIG.read_text())
+    stages = ['mise', 'tools', 'brew', 'shell-repositories', 'shell-completions', 'variable-fonts', 'marktext']
+    if 'rust' in config.get('tools', {}):
+        stages.append('rustup')
+    stages += [key for key in config.get('bootstrap', {}).get('packages', {}) if key.startswith('brew-cask:')]
+    values, errors = {}, {}
+    for stage in stages:
+        try:
+            for key, value in snapshot(stage).items():
+                values[stage + '/' + key] = dict(value, stage=stage)
+        except Exception as error:
+            errors[stage] = str(error)
+    return values, errors
+
+
+def load_report(path):
+    if not path.exists():
+        return None
+    return json.loads(path.read_text())
+
+
+def rotate_logs(limit=5_000_000):
+    # Copy and truncate: launchd's open stdout/stderr descriptors keep writing
+    # into the same inode. Renaming would leave an unbounded orphaned log.
+    for path in [LOG, LOG.parent / 'mise-maintenance-agent.log', LOG.parent / 'mise-maintenance-agent.err.log']:
+        if path.exists() and path.stat().st_size > limit:
+            shutil.copyfile(path, path.with_suffix('.previous.log'))
+            with path.open('r+') as output:
+                output.truncate()
+
+
+def save_report(report, scheduled=False, keep=60):
+    destination = 'last-check.json' if report['check_only'] else 'last-run.json'
+    text = json.dumps(report, indent=2) + '\n'
+    atomic_write(STATE / destination, text)
+    if not report['check_only']:
+        atomic_write(STATE / ('last-scheduled.json' if scheduled else 'last-manual.json'), text)
+    directory = STATE / 'history'
+    stamp = datetime.fromisoformat(report['started_at']).strftime('%Y%m%dT%H%M%S.%fZ')
+    atomic_write(directory / (stamp + '-' + report['origin'] + '.json'), text)
+    for old in sorted(directory.glob('*.json'), reverse=True)[keep:]:
+        old.unlink()
+
+
+def background_changes(previous, before, errors):
+    if not previous or 'inventory_after' not in previous:
+        return []
+    old = previous['inventory_after']
+    invalid = set(errors) | set(previous.get('inventory_errors_after', {}))
+    observed_stages = {v['stage'] for v in before.values()}
+    # Ceasing to declare an app is not proof that it was uninstalled.
+    old = {k: v for k, v in old.items() if v['stage'] not in invalid and v['stage'] in observed_stages}
+    before = {k: v for k, v in before.items() if v['stage'] not in invalid}
+    return compare(old, before)
+
+
+def cask_result(text, running):
+    """Use native platform/version checks; do not guess cask metadata versions."""
+    if 'running and updates itself' in text:
+        return {'state': 'deferred-running-app', 'availability': 'confirmed'}
+    if running and re.search(r'install cask [^/\s]+/[^\s]+', text):
+        return {'state': 'deferred-running-app', 'availability': 'confirmed'}
+    if 'skipped:' in text or 'WARN' in text:
+        return {'state': 'availability-unknown', 'notes': ['Native check could not prove an eligible update; see the detailed log.']}
+    if 'already up to date' in text or 'already installed' in text:
+        return {'state': 'current'}
+    if running:
+        return {'state': 'availability-unknown', 'notes': ['Native check could not prove an eligible update; see the detailed log.']}
+    return {'state': 'success'}
+
+
+def cask_update(key, check, log, command):
+    try:
+        apps = cask_apps(key.split(':', 1)[1])
+    except RuntimeError:
+        # Missing packages are installed by apply. Existing ownership errors
+        # are still caught by the observer and the native mutation checks.
+        apps = []
+    running = any(is_running(app) for app in apps)
+    start = log.tell()
+    if check or running:
+        if check:
+            command([MISE, 'bootstrap', 'packages', 'apply', key, '-y', '--dry-run'], log)
+        command([MISE, 'bootstrap', 'packages', 'upgrade', key, '-y', '--dry-run'], log)
+        log.flush(); log.seek(start); text = log.read(); log.seek(0, 2)
+        result = cask_result(text, running)
+        if check:
+            result['state'] = 'checked'
+        return result
+    command([MISE, 'bootstrap', 'packages', 'apply', key, '-y'], log)
+    start = log.tell()
+    command([MISE, 'bootstrap', 'packages', 'upgrade', key, '-y'], log)
+    log.flush(); log.seek(start); text = log.read(); log.seek(0, 2)
+    return cask_result(text, False)
+
+
+def health():
+    checks = {}
+    def check(name, action):
+        try:
+            checks[name] = action()
+        except Exception as error:
+            checks[name] = {'state': 'failed', 'detail': str(error)}
+    def doctor():
+        output = read_command([MISE, 'doctor'])
+        warning = re.search(r'\d+ warnings? found:\s*(.*?)\n\nNo problems found', output, re.S)
+        return {'state': 'warning' if warning else 'healthy', 'detail': warning[1].strip() if warning else 'No Mise doctor errors or warnings', 'output': output}
+    check('mise-doctor', doctor)
+    def service(name):
+        output = read_command(['/bin/launchctl', 'print', f'gui/{os.getuid()}/dev.mise.{name}'])
+        code = re.search(r'last exit code = (\d+)', output)
+        if code and int(code[1]):
+            raise RuntimeError(f'Last service exit code: {code[1]}')
+        if name == 'mise-tool-update' and 'state = running' not in output:
+            raise RuntimeError('Tool update watcher is loaded but not running')
+        if name == 'mise-maintenance' and '--scheduled' not in output:
+            raise RuntimeError('Loaded maintenance agent lacks scheduled-run tracking; run setup:sync')
+        return {'state': 'healthy', 'detail': 'running' if 'state = running' in output else 'loaded; last exit successful' if code else 'loaded; has not exited yet'}
+    for name in ['mise-tool-update', 'mise-maintenance']:
+        check(name, lambda n=name: service(n))
+    def freshness():
+        report = load_report(STATE / 'last-scheduled.json')
+        if not report:
+            raise RuntimeError('No scheduled run recorded; manual runs do not count')
+        age = (datetime.now(timezone.utc) - datetime.fromisoformat(report['finished_at'])).total_seconds()
+        if report['state'] != 'success':
+            raise RuntimeError(f"Last scheduled run {report['state']}: {report.get('errors', [])}")
+        if age < 0 or age > 36 * 3600:
+            raise RuntimeError(f'Last scheduled run is {age / 3600:.1f} hours old (limit 36h)')
+        return {'state': 'healthy', 'detail': f'{age / 3600:.1f} hours ago', 'finished_at': report['finished_at']}
+    check('scheduled-freshness', freshness)
+    return {'state': 'healthy' if all(c['state'] == 'healthy' for c in checks.values()) else 'attention-needed', 'checked_at': now(), 'checks': checks}
+
+
+def show_health(console):
+    report = health()
+    if console.json_output:
+        console.say(json.dumps(report, indent=2), force=True)
+    else:
+        console.say('Automatic update health: ' + report['state'])
+        for name, result in report['checks'].items():
+            console.say(f"  {'✓' if result['state'] == 'healthy' else '✗'} {name}: {result['detail']}")
+    return 0 if report['state'] == 'healthy' else 1
+
+
+def show_history(console, limit):
+    reports = [load_report(path) for path in sorted((STATE / 'history').glob('*.json'), reverse=True)[:limit]]
+    if console.json_output:
+        console.say(json.dumps(reports, indent=2), force=True)
+    elif not reports:
+        console.say('No maintenance history recorded yet.')
+    else:
+        for report in reports:
+            local = datetime.fromisoformat(report['started_at']).astimezone().strftime('%Y-%m-%d %H:%M')
+            console.say(f"{local}  {report['origin']:9} {report['state']:11} {len(report.get('changes', []))} changes · {len(report.get('since_previous_run', []))} between runs · {len(report.get('errors', []))} errors")
+    return 0
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--check', action='store_true', help='Preview updates without applying them')
     parser.add_argument('--status', action='store_true', help='Print the most recent scheduled/manual run')
     parser.add_argument('--verbose', action='store_true', help='Stream command output as well as saving the log')
     parser.add_argument('--json', action='store_true', dest='json_output', help='Print only the structured report on stdout')
+    parser.add_argument('--scheduled', action='store_true', help='Tag this invocation as a launchd run')
+    parser.add_argument('--health', action='store_true', help='Verify doctor, services, and scheduled freshness')
+    parser.add_argument('--history', action='store_true', help='Show bounded local report history')
+    parser.add_argument('--limit', type=int, default=10, choices=range(1, 61), metavar='1..60')
+    parser.add_argument('--marktext', action='store_true', help='Resolve and apply MarkText for bootstrap')
     args = parser.parse_args(argv)
     console = Console(verbose=args.verbose, json_output=args.json_output)
     command = partial(run, console=console)
+    if args.health:
+        return show_health(console)
+    if args.history:
+        return show_history(console, args.limit)
+    if args.marktext:
+        LOG.parent.mkdir(parents=True, exist_ok=True)
+        with LOG.open('a+', buffering=1) as log:
+            result = marktext(args.check, log, console)
+        console.say(json.dumps(result, indent=2), force=True)
+        return 0
     if args.status:
         path = STATE / 'last-run.json'
         console.summary(json.loads(path.read_text()) if path.exists() else {'state': 'not-run-yet'}, show_steps=True)
@@ -606,10 +797,12 @@ def main(argv=None):
             console.summary({'state': 'already-running'})
             return 0
         LOG.parent.mkdir(parents=True, exist_ok=True)
-        if LOG.exists() and LOG.stat().st_size > 5_000_000:
-            os.replace(LOG, LOG.with_suffix('.previous.log'))
+        rotate_logs()
         started = time.monotonic()
-        report = {'started_at': now(), 'check_only': args.check, 'results': {}, 'errors': [], 'log': str(LOG), 'schema_version': 2}
+        report = {'started_at': now(), 'check_only': args.check, 'results': {}, 'errors': [], 'log': str(LOG), 'schema_version': 3, 'origin': 'preview' if args.check else 'scheduled' if args.scheduled else 'manual'}
+        previous = load_report(STATE / 'last-run.json')
+        report['inventory_before'], report['inventory_errors_before'] = inventory()
+        report['since_previous_run'] = background_changes(previous, report['inventory_before'], report['inventory_errors_before'])
         console.say('Previewing maintenance updates' if args.check else 'Running maintenance updates')
         console.say()
         with LOG.open('a+', buffering=1) as log:
@@ -660,7 +853,7 @@ def main(argv=None):
                             observation_errors.append(f'preview: {error}')
                     if result['state'] == 'update-available' and name == 'marktext':
                         result['plans'] = [{'name': 'MarkText', 'kind': 'version',
-                                            'before': result['installed'], 'after': result['available']}]
+                                            'before': result.get('installed'), 'after': result['available']}]
                     if name == 'shell-repositories' and before is not None:
                         dirty = [record for record in before.values() if record.get('dirty')]
                         result.setdefault('notes', []).extend(f"{record['name']} preserved because it has local edits" for record in dirty)
@@ -675,12 +868,18 @@ def main(argv=None):
                     console.finished(name, result)
                 finally:
                     console.stop_progress()
+            step('shell-repositories', lambda: command([MISE, 'bootstrap', 'repos', 'update', '--skip-dirty', '-y'] + (['--dry-run'] if args.check else []), log, timeout=600))
             if not args.check:
+                # A fresh process reads the pulled manifest before applying it.
+                # Native packages use their guarded per-package stages below.
+                # Reloading our own LaunchAgent would interrupt this process.
+                skip = 'packages,macos-launchd-agents' if args.scheduled else 'packages'
+                step('setup', lambda: command([MISE, 'bootstrap', '--skip', skip, '--skip-dirty', '-y'], log))
                 step('mise', lambda: command([MISE, 'self-update', '-y', '--no-plugins'], log, timeout=600))
             step('tools', lambda: command([MISE, 'outdated', '--global', '--json'] if args.check else [MISE, 'upgrade', '--global', '-y'], log))
             if 'rust' in tomllib.loads(CONFIG.read_text()).get('tools', {}):
                 step('rustup', lambda: command([HOME / '.cargo/bin/rustup', 'check'] if args.check else [HOME / '.cargo/bin/rustup', 'self', 'update'], log, timeout=600))
-            step('shell-repositories', lambda: command([MISE, 'bootstrap', 'repos', 'update', '--skip-dirty', '-y'] + (['--dry-run'] if args.check else []), log, timeout=600))
+
             if not args.check:
                 step('shell-completions', lambda: command([MISE, 'run', 'shell:completions'], log, timeout=120))
             step('variable-fonts', lambda: command([sys.executable, CONFIG.parent / 'scripts/google-fonts.py', '--check' if args.check else '--deploy'], log, timeout=300))
@@ -693,22 +892,27 @@ def main(argv=None):
                     step(key, unsupported_app)
             managers = sorted({key.split(':', 1)[0] for key in packages} - {'brew-cask', 'macos-app'})
             for manager in managers:
-                step(manager, lambda m=manager: command([MISE, 'bootstrap', 'packages', 'upgrade', '--manager', m, '-y'] + (['--dry-run'] if args.check else []), log))
+                def native_update(m=manager):
+                    command([MISE, 'bootstrap', 'packages', 'apply', '--manager', m, '-y'] + (['--dry-run'] if args.check else []), log)
+                    command([MISE, 'bootstrap', 'packages', 'upgrade', '--manager', m, '-y'] + (['--dry-run'] if args.check else []), log)
+                step(manager, native_update)
             for key in packages:
                 if not key.startswith('brew-cask:'):
                     continue
-                def cask_update(k=key):
-                    if not args.check and any(is_running(app) for app in cask_apps(k.split(':', 1)[1])):
-                        return {'state': 'deferred-running-app'}
-                    command([MISE, 'bootstrap', 'packages', 'upgrade', k, '-y'] + (['--dry-run'] if args.check else []), log)
-                    return {'state': 'checked' if args.check else 'success'}
-                step(key, cask_update)
+                step(key, lambda k=key: cask_update(k, args.check, log, command))
             report['finished_at'] = now()
             report['elapsed_seconds'] = round(time.monotonic() - started, 3)
             report['state'] = 'interrupted' if report.get('interrupted') else 'failed' if report['errors'] else 'success'
             report['changes'] = [dict(change, stage=name) for name, result in report['results'].items() for change in result.get('changes', [])]
             report['planned_changes'] = [dict(plan, stage=name) for name, result in report['results'].items() for plan in result.get('plans', [])]
-            atomic_write(STATE / ('last-check.json' if args.check else 'last-run.json'), json.dumps(report, indent=2) + '\n')
+            report['inventory_after'], report['inventory_errors_after'] = inventory()
+            previous_results = (previous or {}).get('results', {})
+            for name, result in report['results'].items():
+                if result['state'] == 'deferred-running-app':
+                    old = previous_results.get(name, {})
+                    result['deferred_since'] = old.get('deferred_since', report['started_at']) if old.get('state') == 'deferred-running-app' else report['started_at']
+                    result['consecutive_deferrals'] = old.get('consecutive_deferrals', 0) + 1 if old.get('state') == 'deferred-running-app' else 1
+            save_report(report, args.scheduled)
             console.summary(report)
             return 130 if report.get('interrupted') else 1 if report['errors'] else 0
 

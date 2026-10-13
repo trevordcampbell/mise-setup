@@ -59,18 +59,14 @@ uv = "latest"
 [bootstrap.services.mise-tool-update]
 builtin = "tool-update"
 
-[bootstrap.packages."macos-app:marktext"]
-version = "0.21.2"
-url = "https://github.com/marktext/marktext/releases/download/v0.21.2/marktext-mac-arm64-0.21.2.dmg"
-sha256 = "6c07b697ba3262e8b130ab3ee85bdc621077cf4035c8cc339098cdb2892142c1"
-artifact = "MarkText.app"
-adopt = true
-os = "macos/arm64"
+[vars]
+# Official release fields are resolved into local state, never committed here.
+marktext_artifact = "MarkText.app"
 
 # Schedule host packages, desktop apps, and mise itself independently of shells.
 [bootstrap.macos.launchd.agents.mise-maintenance]
 program = "~/.local/bin/mise"
-args = ["exec", "--", "python", "{{ env.HOME }}/.config/mise/scripts/maintenance.py"]
+args = ["exec", "--", "python", "{{ env.HOME }}/.config/mise/scripts/maintenance.py", "--scheduled"]
 working_directory = "~"
 environment = { PATH = "{{ env.HOME }}/.local/bin:{{ env.HOME }}/.local/share/mise/shims:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/bin:/bin:/usr/sbin:/sbin" }
 run_at_load = true
@@ -138,7 +134,7 @@ run = 'mkdir -p "$HOME/.local/share/zsh/site-functions" && "$HOME/.local/bin/mis
 [bootstrap.hooks]
 # Install tools before fonts and RunAtLoad update jobs on a fresh machine.
 pre-packages = '"$HOME/.local/bin/mise" -C "$HOME" install'
-final = ['"$HOME/.local/bin/mise" -C "$HOME" run github:credentials', '"$HOME/.local/bin/mise" -C "$HOME" run shell:completions']
+final = ['"$HOME/.local/bin/mise" -C "$HOME" exec -- python "$HOME/.config/mise/scripts/maintenance.py" --marktext', '"$HOME/.local/bin/mise" -C "$HOME" run github:credentials', '"$HOME/.local/bin/mise" -C "$HOME" run shell:completions']
 pre-dotfiles = '"$HOME/.local/bin/mise" -C "$HOME" run fonts:sync'
 
 [tasks."fonts:sync"]
@@ -161,6 +157,27 @@ description = "Configure stable GitHub credentials and noreply commit email"
 dir = "~"
 run = [
   'git -C "$HOME/.config/mise" config user.email 55037769+trevordcampbell@users.noreply.github.com',
-  'git config --global credential.https://github.com.helper ""',
+  'git config --global --replace-all credential.https://github.com.helper ""',
   "git config --global --add credential.https://github.com.helper '!$HOME/.local/share/mise/shims/gh auth git-credential'",
 ]
+
+[tasks."setup:sync"]
+output = "interleave"
+quiet = true
+description = "Pull saved setup and apply newly declared resources safely"
+dir = "~"
+run = '"$HOME/.local/bin/mise" -C "$HOME" exec -- python "$HOME/.config/mise/scripts/maintenance.py"'
+
+[tasks."maintenance:health"]
+output = "interleave"
+quiet = true
+description = "Verify automatic update services and scheduled freshness"
+dir = "~"
+run = '"$HOME/.local/bin/mise" -C "$HOME" exec -- python "$HOME/.config/mise/scripts/maintenance.py" --health'
+
+[tasks."maintenance:history"]
+output = "interleave"
+quiet = true
+description = "Show recent maintenance runs and observed changes"
+dir = "~"
+run = '"$HOME/.local/bin/mise" -C "$HOME" exec -- python "$HOME/.config/mise/scripts/maintenance.py" --history'

@@ -1,0 +1,58 @@
+name: Verify bootstrap setup
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: verify-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: '3.11'
+          - os: macos-latest
+            python: '3.15'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
+        with:
+          version: '2026.10.8'
+          install: false
+          cache: false
+      - name: Test without an installed host setup
+        shell: bash
+        run: |
+          empty_home=$(mktemp -d)
+          HOME="$empty_home" python -m unittest discover -s tests -p 'test_*.py' -v
+          python -m compileall -q scripts tests
+      - name: Validate configuration and task graph without applying it
+        shell: bash
+        env:
+          MISE_GLOBAL_CONFIG_FILE: ${{ github.workspace }}/config.toml
+          MISE_CONFIG_DIR: ${{ runner.temp }}/mise-config
+          MISE_SYSTEM_CONFIG_FILE: ${{ runner.temp }}/absent-system.toml
+          MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
+        run: |
+          python scripts/check-config.py
+          mise tasks validate --errors-only
+      - name: Check shell syntax
+        shell: bash
+        run: |
+          if ! command -v zsh >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y zsh
+          fi
+          zsh -n dotfiles/.zshrc dotfiles/.zprofile dotfiles/.p10k.zsh dotfiles/.fzf.zsh
+          bash -n dotfiles/.bashrc dotfiles/.fzf.bash

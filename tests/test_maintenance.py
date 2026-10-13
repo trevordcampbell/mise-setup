@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 import os
+import plistlib
 from pathlib import Path
 import tempfile
 import threading
@@ -22,9 +23,13 @@ class UpdateSafetyTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.config = Path(self.temp.name) / 'config.toml'
-        self.original = maintenance.CONFIG.read_text()
+        self.original = '[vars]\nmarktext_artifact = "MarkText.app"\n[bootstrap.packages]\n'
         self.config.write_text(self.original)
-        self.settings = patch.multiple(maintenance, CONFIG=self.config, STATE=Path(self.temp.name) / 'state')
+        self.apps = Path(self.temp.name) / 'Applications'
+        self.info = self.apps / 'MarkText.app/Contents/Info.plist'
+        self.info.parent.mkdir(parents=True)
+        self.info.write_bytes(plistlib.dumps({'CFBundleShortVersionString': '0.21.2'}))
+        self.settings = patch.multiple(maintenance, CONFIG=self.config, STATE=Path(self.temp.name) / 'state', APPLICATIONS=self.apps)
         self.settings.start()
         version = '0.99.0'
         filename = f'marktext-mac-arm64-{version}.dmg'
@@ -74,24 +79,32 @@ class UpdateSafetyTests(unittest.TestCase):
             run.assert_not_called()
             self.assertEqual(self.config.read_text(), self.original)
 
-    def test_install_failure_restores_original_config(self):
+    def test_install_failure_preserves_manifest_and_no_verified_success_state(self):
         with patch.object(maintenance, 'is_running', return_value=False), patch.object(maintenance, 'run', side_effect=RuntimeError('download failed')):
             with self.assertRaises(RuntimeError):
                 self.evaluate()
         self.assertEqual(self.config.read_text(), self.original)
 
-    def test_success_changes_only_marktext_download_fields(self):
-        before = tomllib.loads(self.original)
-        with patch.object(maintenance, 'is_running', return_value=False), patch.object(maintenance, 'run') as run, patch.object(maintenance.plistlib, 'load', side_effect=[{'CFBundleShortVersionString': '0.21.2'}, {'CFBundleShortVersionString': '0.99.0'}]):
+    def test_success_generates_only_local_verified_release_state(self):
+        def command(args, log, **kwargs):
+            if 'apply' in args:
+                isolated = kwargs['env']
+                self.assertNotEqual(isolated['MISE_CONFIG_DIR'], str(self.config.parent))
+                generated = tomllib.loads(Path(isolated['MISE_GLOBAL_CONFIG_FILE']).read_text())
+                self.assertEqual(generated['bootstrap']['packages']['macos-app:marktext']['sha256'], 'a' * 64)
+                self.info.write_bytes(plistlib.dumps({'CFBundleShortVersionString': '0.99.0'}))
+        with patch.object(maintenance, 'is_running', return_value=False), patch.object(maintenance, 'run', side_effect=command) as run:
             self.assertEqual(self.evaluate()['state'], 'updated')
             self.assertEqual(run.call_count, 2)
-        after = tomllib.loads(self.config.read_text())
-        entry = after['bootstrap']['packages']['macos-app:marktext']
-        self.assertEqual(entry['version'], '0.99.0')
-        self.assertEqual(entry['sha256'], 'a' * 64)
-        after['bootstrap']['packages']['macos-app:marktext'] = before['bootstrap']['packages']['macos-app:marktext']
-        self.assertEqual(after, before)
+        self.assertEqual(self.config.read_text(), self.original)
+        metadata = json.loads((maintenance.STATE / 'marktext/release.json').read_text())
+        self.assertEqual(metadata['version'], '0.99.0')
 
+    def test_bootstrap_installs_marktext_when_app_is_missing(self):
+        self.info.unlink()
+        with patch.object(maintenance, 'is_running', return_value=False), patch.object(maintenance, 'run', side_effect=lambda *args, **kwargs: self.info.write_bytes(plistlib.dumps({'CFBundleShortVersionString': '0.99.0'}))):
+            self.assertEqual(self.evaluate()['state'], 'updated')
+        self.assertEqual(self.config.read_text(), self.original)
 
     def test_atomic_write_keeps_a_dotfile_symlink(self):
         source = Path(self.temp.name) / 'tracked.toml'
@@ -112,10 +125,13 @@ class MaintenanceOutputTests(unittest.TestCase):
         self.state = root / 'state'
         self.settings = patch.multiple(maintenance, CONFIG=config, STATE=self.state, LOG=root / 'maintenance.log')
         self.settings.start()
+        self.inventory_patch = patch.object(maintenance, 'inventory', return_value=({}, {}))
+        self.inventory_patch.start()
         self.stdout = io.StringIO()
         self.stderr = io.StringIO()
 
     def tearDown(self):
+        self.inventory_patch.stop()
         self.settings.stop()
         self.temp.cleanup()
 
@@ -137,8 +153,10 @@ class MaintenanceOutputTests(unittest.TestCase):
             calls.append(list(map(str, args)))
             if 'upgrade' in args:
                 self.assertIn('Running maintenance updates', self.stdout.getvalue())
-            if 'upgrade' in args:
+            if 'upgrade' in args and '--global' in args:
                 raise RuntimeError('simulated update failure')
+            if '--dry-run' in args:
+                log.write('skipped: installed app is running and updates itself\n')
         self.assertEqual(self.invoke([], command=command, running=True), 1)
         output = self.stdout.getvalue()
         self.assertIn('Global tools: simulated update failure', output)
@@ -382,7 +400,7 @@ class ChangeReportingTests(unittest.TestCase):
             marktext.assert_not_called()
             report = json.loads(fixture.stdout.getvalue())
             self.assertEqual(report['state'], 'interrupted')
-            self.assertEqual(set(report['results']), {'mise', 'tools'})
+            self.assertEqual(set(report['results']), {'shell-repositories', 'setup', 'mise', 'tools'})
             self.assertEqual(report['changes'][0]['after'], '2.0')
         finally: fixture.tearDown()
 
@@ -401,7 +419,9 @@ class ChangeReportingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp);(root / 'opt').mkdir();(root / 'Cellar').mkdir()
             (root / 'opt/git').symlink_to(root / 'Cellar/git/1.0')
-            with patch.object(maintenance, 'PREFIX', root):
+            disposable_config = root / 'config.toml'
+            disposable_config.write_text('[bootstrap.packages]\n')
+            with patch.object(maintenance, 'PREFIX', root), patch.object(maintenance, 'CONFIG', disposable_config):
                 with self.assertRaisesRegex(RuntimeError, 'Broken native package link'):
                     maintenance.snapshot('brew')
 
@@ -436,6 +456,124 @@ class ChangeReportingTests(unittest.TestCase):
             self.assertEqual(changes[0]['kind'], 'revision')
             self.assertEqual(len(changes[0]['before']), 40)
             self.assertNotEqual(changes[0]['before'], changes[0]['after'])
+
+
+class SyncHealthHistoryTests(unittest.TestCase):
+    def setUp(self):
+        self.fixture = MaintenanceOutputTests('test_json_stdout_is_exactly_the_saved_report')
+        self.fixture.setUp()
+
+    def tearDown(self):
+        self.fixture.tearDown()
+
+    def test_pulled_declaration_is_applied_before_upgrade(self):
+        calls = []
+        def command(args, log, **kwargs):
+            calls.append(list(map(str, args)))
+            if 'repos' in args:
+                maintenance.CONFIG.write_text('[tools]\n[bootstrap.packages]\n"brew:new-tool" = "latest"\n')
+            log.write('already up to date\n')
+        self.assertEqual(self.fixture.invoke([], command=command), 0)
+        repo = next(i for i, c in enumerate(calls) if 'repos' in c)
+        bootstrap = next(i for i, c in enumerate(calls) if '--skip' in c)
+        apply = next(i for i, c in enumerate(calls) if 'apply' in c and '--manager' in c)
+        upgrade = next(i for i, c in enumerate(calls) if 'upgrade' in c and '--manager' in c)
+        self.assertLess(repo, bootstrap);self.assertLess(bootstrap, apply);self.assertLess(apply, upgrade)
+        self.assertIn('--skip-dirty', calls[repo]);self.assertIn('brew', calls[apply])
+
+    def test_manual_success_does_not_overwrite_scheduled_failure(self):
+        scheduled = {'state': 'failed', 'finished_at': maintenance.now(), 'errors': ['tools']}
+        maintenance.atomic_write(maintenance.STATE / 'last-scheduled.json', json.dumps(scheduled))
+        self.assertEqual(self.fixture.invoke(['--json']), 0)
+        self.assertEqual(maintenance.load_report(maintenance.STATE / 'last-scheduled.json'), scheduled)
+        self.assertEqual(maintenance.load_report(maintenance.STATE / 'last-manual.json')['state'], 'success')
+        with patch.object(maintenance, 'read_command', return_value='state = running\n--scheduled\nlast exit code = 0'):
+            report = maintenance.health()
+        self.assertEqual(report['state'], 'attention-needed')
+        self.assertEqual(report['checks']['scheduled-freshness']['state'], 'failed')
+
+    def test_scheduled_run_has_separate_report_and_does_not_reload_itself(self):
+        calls = []
+        def command(args, log, **kwargs):
+            calls.append(list(map(str, args))); log.write('already up to date\n')
+        self.assertEqual(self.fixture.invoke(['--scheduled', '--json'], command=command), 0)
+        report = maintenance.load_report(maintenance.STATE / 'last-scheduled.json')
+        self.assertEqual(report['origin'], 'scheduled')
+        self.assertFalse((maintenance.STATE / 'last-manual.json').exists())
+        self.assertIn('packages,macos-launchd-agents', next(c for c in calls if '--skip' in c))
+
+    def test_health_detects_missing_stale_and_failed_services(self):
+        with patch.object(maintenance, 'read_command', side_effect=RuntimeError('not loaded')):
+            self.assertEqual(maintenance.health()['state'], 'attention-needed')
+        maintenance.atomic_write(maintenance.STATE / 'last-scheduled.json', json.dumps({'state': 'success', 'finished_at': (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()}))
+        with patch.object(maintenance, 'read_command', return_value='state = running\n--scheduled\nlast exit code = 0'):
+            self.assertEqual(maintenance.health()['checks']['scheduled-freshness']['state'], 'failed')
+        maintenance.atomic_write(maintenance.STATE / 'last-scheduled.json', json.dumps({'state': 'success', 'finished_at': maintenance.now()}))
+        with patch.object(maintenance, 'read_command', return_value='state = running\n--scheduled\nlast exit code = 0'):
+            self.assertEqual(maintenance.health()['state'], 'healthy')
+        with patch.object(maintenance, 'read_command', return_value='state = running\n--scheduled\nlast exit code = 2'):
+            self.assertEqual(maintenance.health()['checks']['mise-maintenance']['state'], 'failed')
+
+    def test_doctor_warnings_are_not_silently_healthy(self):
+        with patch.object(maintenance, 'read_command', return_value='1 warning found:\n\n1. last auto_update failed\n\nNo problems found'):
+            report = maintenance.health()
+        self.assertEqual(report['checks']['mise-doctor']['state'], 'warning')
+        self.assertEqual(report['state'], 'attention-needed')
+
+    def test_history_is_bounded_and_keeps_latest_reports(self):
+        for i in range(7):
+            report = {'started_at': (datetime.now(timezone.utc) + timedelta(seconds=i)).isoformat(), 'origin': 'manual', 'check_only': False, 'state': 'success', 'results': {}, 'changes': [], 'errors': [], 'number': i}
+            maintenance.save_report(report, keep=3)
+        files = sorted((maintenance.STATE / 'history').glob('*.json'))
+        self.assertEqual([json.loads(p.read_text())['number'] for p in files], [4, 5, 6])
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(maintenance.main(['--history', '--json', '--limit', '2']), 0)
+        self.assertEqual([r['number'] for r in json.loads(output.getvalue())], [6, 5])
+
+    def test_rotation_preserves_launchd_open_file_descriptor(self):
+        path = maintenance.LOG.parent / 'mise-maintenance-agent.log'
+        path.write_text('old output')
+        with path.open('a') as agent:
+            inode = path.stat().st_ino
+            maintenance.rotate_logs(limit=3)
+            agent.write('new');agent.flush()
+        self.assertEqual(path.stat().st_ino, inode)
+        self.assertEqual(path.read_text(), 'new')
+        self.assertEqual(path.with_suffix('.previous.log').read_text(), 'old output')
+
+    def test_background_changes_are_separate_and_unknown_is_not_removal(self):
+        previous = {'inventory_after': {'tools/uv': maintenance.entity('uv', '1', stage='tools'), 'brew/git': maintenance.entity('git', '1', stage='brew')}}
+        before = {'tools/uv': maintenance.entity('uv', '2', stage='tools')}
+        changes = maintenance.background_changes(previous, before, {'brew': 'unreadable'})
+        self.assertEqual(len(changes), 1)
+        self.assertEqual(changes[0]['name'], 'uv')
+        report = {'state': 'success', 'schema_version': 3, 'results': {}, 'errors': [], 'changes': [], 'since_previous_run': changes}
+        with redirect_stdout(self.fixture.stdout): maintenance.Console().summary(report)
+        self.assertIn('outside this run', self.fixture.stdout.getvalue())
+
+    def test_removed_declaration_is_not_reported_as_app_uninstall(self):
+        previous = {'inventory_after': {'brew-cask:example/app': maintenance.entity('Example', '1', stage='brew-cask:example')}}
+        self.assertEqual(maintenance.background_changes(previous, {}, {}), [])
+
+    def test_running_current_pending_and_unknown_are_distinct(self):
+        self.assertEqual(maintenance.cask_result('already up to date', True)['state'], 'current')
+        self.assertEqual(maintenance.cask_result('install cask test/2.0', True)['state'], 'deferred-running-app')
+        self.assertEqual(maintenance.cask_result('skipped: installed app is running and updates itself', True)['availability'], 'confirmed')
+        self.assertEqual(maintenance.cask_result('skipped: installed app is current, newer, or incomparable', True)['state'], 'availability-unknown')
+        self.assertEqual(maintenance.cask_result('unrecognized output', True)['state'], 'availability-unknown')
+
+    def test_running_app_preview_never_applies_and_tracks_repeated_deferrals(self):
+        def command(args, log, **kwargs):
+            if 'google-chrome' in ' '.join(map(str, args)):
+                self.assertIn('--dry-run', args)
+                log.write('skipped: installed app is running and updates itself\n')
+        for i in range(2):
+            self.fixture.stdout.seek(0);self.fixture.stdout.truncate()
+            self.assertEqual(self.fixture.invoke(['--json'], command=command, running=True), 0)
+        result = maintenance.load_report(maintenance.STATE / 'last-run.json')['results']['brew-cask:google-chrome']
+        self.assertEqual(result['consecutive_deferrals'], 2)
+        self.assertIn('deferred_since', result)
 
 
 if __name__ == '__main__':
