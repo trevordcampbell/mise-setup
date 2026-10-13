@@ -54,5 +54,9 @@ jobs:
             sudo apt-get update -qq
             sudo apt-get install -y zsh
           fi
-          zsh -n dotfiles/.zshrc dotfiles/.zprofile dotfiles/.p10k.zsh dotfiles/.fzf.zsh
-          bash -n dotfiles/.bashrc dotfiles/.fzf.bash
+          for source in dotfiles/.zshrc dotfiles/.zprofile dotfiles/.p10k.zsh dotfiles/.fzf.zsh; do
+            zsh -n "$source"
+          done
+          for source in dotfiles/.bashrc dotfiles/.fzf.bash; do
+            bash -n "$source"
+          done
