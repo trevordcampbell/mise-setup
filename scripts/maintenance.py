@@ -10,6 +10,7 @@ import hashlib
 import os
 from pathlib import Path
 import plistlib
+import platform
 import re
 import selectors
 import shutil
@@ -20,6 +21,7 @@ import tempfile
 import time
 import threading
 import tomllib
+import xml.etree.ElementTree as ET
 from urllib.request import Request, urlopen
 
 HOME = Path.home()
@@ -110,6 +112,9 @@ def outcome(result):
         return '!', 'Completed; change verification unavailable', '33'
     if state == 'update-available':
         return '↑', f"Update available: {result.get('installed', '?')} → {result.get('available', '?')}", '33'
+    vendor = result.get('vendor_check', {})
+    if vendor.get('state') in ('current', 'newer'):
+        return '✓', f"{'Current' if vendor['state'] == 'current' else 'Newer than stable'} ({vendor['installed']})", '32'
     return '✓', 'Unchanged' if result.get('before') is not None else 'Check completed', '32'
 
 
@@ -194,7 +199,7 @@ class Console:
         results = report.get('results', {})
         failed = [name for name, r in results.items() if r['state'] in ('failed', 'interrupted')]
         deferred = [name for name, r in results.items() if r['state'] == 'deferred-running-app']
-        unverified = [name for name, r in results.items() if r.get('observation_errors') or r.get('plan_unverified') or r.get('state') == 'availability-unknown']
+        unverified = [name for name, r in results.items() if r.get('observation_errors') or r.get('plan_unverified') or r.get('state') == 'availability-unknown' or r.get('vendor_check', {}).get('state') == 'unverified']
         changes = report.get('changes', [])
         plans = report.get('planned_changes', [])
         notes = [(name, note) for name, r in results.items() for note in r.get('notes', [])]
@@ -251,6 +256,19 @@ class Console:
             for name in deferred:
                 count = results[name].get('consecutive_deferrals', 1)
                 self.say(f"  {label(name)}: update pending — close and retry" + (f' ({count} consecutive runs)' if count > 1 else ''))
+        verified_apps = [(name, r['vendor_check']) for name, r in results.items()
+                         if r.get('vendor_check', {}).get('state') in ('current', 'newer', 'update-available')]
+        if verified_apps:
+            self.say()
+            self.say(self.paint('Official stable release checks', '1'))
+            for name, vendor in verified_apps:
+                if vendor['state'] == 'current':
+                    detail = f"current ({vendor['installed']})"
+                elif vendor['state'] == 'newer':
+                    detail = f"installed {vendor['installed']}; stable feed {vendor['available']} — keeping newer app"
+                else:
+                    detail = f"{vendor['installed']} → {vendor['available']} available"
+                self.say(f'  {label(name)}: {detail}')
         if notes:
             self.say()
             self.say(self.paint('Skipped or noted', '33'))
@@ -260,7 +278,7 @@ class Console:
             self.say()
             self.say(self.paint('Change verification unavailable', '33'))
             for name in unverified:
-                detail = '; '.join(results[name].get('observation_errors', [])) or 'See the native plan in the detailed log.'
+                detail = '; '.join(results[name].get('observation_errors', [])) or results[name].get('vendor_check', {}).get('error') or 'See the native plan in the detailed log.'
                 self.say(f'  {label(name)}: {detail}')
         if failed:
             self.say()
@@ -741,7 +759,162 @@ def cask_result(text, running):
     return {'state': 'success'}
 
 
+VENDOR_APPS = {
+    'brew-cask:cursor': ('Cursor.app', 'com.todesktop.230313mzl4w4u92'),
+    'brew-cask:google-chrome': ('Google Chrome.app', 'com.google.Chrome'),
+    'brew-cask:chatgpt': ('ChatGPT.app', 'com.openai.codex'),
+}
+SPARKLE = '{http://www.andymatuschak.org/xml-namespaces/sparkle}'
+
+
+def numeric_version(value):
+    # Compare only known numeric vendor formats, never a marketing version
+    # against an unrelated bundle build or Cursor's artifact/source hashes.
+    if not isinstance(value, str) or not re.fullmatch(r'[0-9]+(?:\.[0-9]+)*', value):
+        raise ValueError(f'Unsupported vendor version: {value!r}')
+    return tuple(map(int, value.split('.')))
+
+
+def compare_numeric_versions(installed, available):
+    old, new = numeric_version(installed), numeric_version(available)
+    if len(old) != len(new):
+        raise ValueError(f'Incompatible version formats: {installed!r} and {available!r}')
+    return (old > new) - (old < new)
+
+
+def vendor_release(key):
+    arm = platform.machine() in ('arm64', 'aarch64')
+    if key == 'brew-cask:cursor':
+        arch = 'arm64' if arm else 'x64'
+        source = f'https://api2.cursor.sh/updates/api/update/darwin-{arch}/cursor/0.0.0/stable'
+        data = json_url(source)
+        version = data['name']
+        numeric_version(version)
+        if not re.fullmatch(r'https://downloads\.cursor\.com/production/[0-9a-f]{40}/darwin/' + arch + r'/Cursor-darwin-' + arch + r'\.zip', data['url']):
+            raise ValueError('Unexpected Cursor stable artifact')
+        return {'version': version, 'source': source, 'channel': 'stable'}
+    if key == 'brew-cask:google-chrome':
+        # A partial Chrome rollout is not the release the stable DMG serves.
+        source = 'https://versionhistory.googleapis.com/v1/chrome/platforms/mac/channels/stable/versions/all/releases?filter=endtime%3Dnone,fraction%3D1'
+        data = json_url(source)
+        if data.get('nextPageToken'):
+            raise ValueError('Google stable release response was paginated; latest release is unverified')
+        versions = [r['version'] for r in data['releases']
+                    if r.get('fraction') == 1 and not r.get('serving', {}).get('endTime')]
+        if not versions:
+            raise ValueError('Google returned no fully rolled-out macOS stable release')
+        return {'version': max(versions, key=numeric_version), 'source': source, 'channel': 'stable (fully rolled out)'}
+    if key == 'brew-cask:chatgpt':
+        suffix = '' if arm else '-x64'
+        source = f'https://persistent.oaistatic.com/codex-app-prod/appcast{suffix}.xml'
+        req = Request(source, headers={'User-Agent': 'mise-maintenance'})
+        with urlopen(req, timeout=30) as response:
+            feed = ET.fromstring(response.read(2_000_000))
+        os_version = numeric_version(read_command(['/usr/bin/sw_vers', '-productVersion']))
+        releases = []
+        for item in feed.findall('./channel/item'):
+            if item.findtext(SPARKLE + 'channel', 'stable') not in ('stable', 'release'):
+                continue
+            hardware = item.findtext(SPARKLE + 'hardwareRequirements')
+            if hardware and hardware != ('arm64' if arm else 'x86_64'):
+                continue
+            minimum = item.findtext(SPARKLE + 'minimumSystemVersion', '0')
+            target = numeric_version(minimum)
+            width = max(len(os_version), len(target))
+            if os_version + (0,) * (width - len(os_version)) < target + (0,) * (width - len(target)):
+                continue
+            enclosure = item.find('enclosure')
+            if enclosure is None or enclosure.get('url') is None:
+                continue
+            version = item.findtext(SPARKLE + 'shortVersionString')
+            build = item.findtext(SPARKLE + 'version')
+            numeric_version(version); numeric_version(build)
+            arch = 'arm64' if arm else 'x64'
+            if enclosure.get('url') != f'https://persistent.oaistatic.com/codex-app-prod/ChatGPT-darwin-{arch}-{version}.zip':
+                raise ValueError('Unexpected ChatGPT stable artifact')
+            releases.append({'version': version, 'build': build, 'source': source, 'channel': 'stable'})
+        if not releases:
+            raise ValueError('No compatible stable ChatGPT release in official feed')
+        return max(releases, key=lambda r: numeric_version(r['build']))
+    return None
+
+
+def assess_vendor_release(key, release):
+    filename, identifier = VENDOR_APPS[key]
+    app = APPLICATIONS / filename
+    if not app.exists():
+        available = release['version']
+        if release.get('build'):
+            available += f" (build {release['build']})"
+        return {'state': 'update-available', 'installed': None, 'available': available,
+                'release': release, 'checked_at': now()}
+    info = plistlib.loads((app / 'Contents/Info.plist').read_bytes())
+    if info.get('CFBundleIdentifier') != identifier:
+        raise ValueError(f'Unexpected bundle identity for {filename}')
+    if key == 'brew-cask:cursor':
+        product = json.loads((app / 'Contents/Resources/app/product.json').read_text())
+        if product.get('quality') != 'stable':
+            raise ValueError('Installed Cursor is not on the stable channel')
+    installed, available = info['CFBundleShortVersionString'], release['version']
+    comparison = compare_numeric_versions(installed, available)
+    # Sparkle orders ChatGPT builds, so a same-version rebuild is an update.
+    if key == 'brew-cask:chatgpt':
+        build_comparison = compare_numeric_versions(info['CFBundleVersion'], release['build'])
+        if comparison and comparison != build_comparison:
+            raise ValueError('ChatGPT marketing and build versions disagree on ordering')
+        comparison = build_comparison
+        installed += f" (build {info['CFBundleVersion']})"
+        available += f" (build {release['build']})"
+    state = 'current' if comparison == 0 else 'newer' if comparison > 0 else 'update-available'
+    return {'state': state, 'installed': installed, 'available': available,
+            'release': release, 'checked_at': now()}
+
+
 def cask_update(key, check, log, command):
+    release, vendor_error = None, None
+    if key in VENDOR_APPS:
+        try:
+            release = vendor_release(key)
+            app = APPLICATIONS / VENDOR_APPS[key][0]
+            if app.exists():
+                assessment = assess_vendor_release(key, release)
+                log.write(f'[{now()}] {key} official vendor check: {json.dumps(assessment)}\n')
+                if assessment['state'] in ('current', 'newer'):
+                    return {'state': assessment['state'], 'vendor_check': assessment}
+        except Exception as error:
+            vendor_error = str(error)
+            log.write(f'[{now()}] {key} vendor check unavailable: {error}\n')
+            if release is not None:
+                # Preserve unexpected channels, identities, and version formats.
+                return {'state': 'availability-unknown', 'vendor_check':
+                        {'state': 'unverified', 'error': vendor_error, 'checked_at': now()}}
+    result = native_cask_update(key, check, log, command)
+    if release is not None and vendor_error is None:
+        # Re-read the live bundle after native installation; reuse this run's
+        # release evidence rather than racing a second network metadata fetch.
+        assessment = assess_vendor_release(key, release)
+        result['vendor_check'] = assessment
+        result['availability'] = 'confirmed'
+        result.pop('notes', None)
+        if assessment['state'] in ('current', 'newer'):
+            result['state'] = assessment['state']
+        else:
+            app = APPLICATIONS / VENDOR_APPS[key][0]
+            result['state'] = 'update-available' if check or not is_running(app) else 'deferred-running-app'
+            result['plans'] = [{'name': label(key), 'kind': 'version',
+                                'before': assessment['installed'], 'after': assessment['available']}]
+            if not check and result['state'] == 'update-available':
+                result['notes'] = ['Vendor confirms an update, but the native installer did not apply it. '
+                                   'Its cask may lag the vendor release; use the app updater or retry later.']
+    elif vendor_error:
+        result['vendor_check'] = {'state': 'unverified', 'error': vendor_error, 'checked_at': now()}
+        result.setdefault('notes', []).append(f'Official vendor check unavailable: {vendor_error}')
+        if result['state'] in ('current', 'success'):
+            result['state'] = 'availability-unknown'
+    return result
+
+
+def native_cask_update(key, check, log, command):
     try:
         apps = cask_apps(key.split(':', 1)[1])
     except RuntimeError:
@@ -910,7 +1083,7 @@ def main(argv=None):
                     result['before'], result['after'] = before, after
                     result['changes'] = compare(before, after) if before is not None and after is not None else []
                     # A failed install can still have changed a subset of artifacts.
-                    if args.check and result['state'] not in ('failed', 'interrupted'):
+                    if args.check and not result.get('vendor_check') and result['state'] not in ('failed', 'interrupted'):
                         log.flush()
                         log.seek(output_start)
                         text = log.read()
@@ -927,6 +1100,10 @@ def main(argv=None):
                         result.setdefault('notes', []).extend(f"{record['name']} preserved because it has local edits" for record in dirty)
                         if dirty:
                             native_notes = [note for note in native_notes if 'has local changes' not in note]
+                    if result.get('vendor_check', {}).get('state') in ('current', 'newer', 'update-available'):
+                        native_notes = [note for note in native_notes if note not in
+                                        ('installed app is current, newer, or incomparable',
+                                         'installed app is running and updates itself')]
                     if native_notes:
                         result['notes'] = list(dict.fromkeys(result.get('notes', []) + native_notes))
                     if observation_errors:

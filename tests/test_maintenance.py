@@ -192,6 +192,183 @@ class DownloadProgressTests(unittest.TestCase):
         self.assertTrue(all('progress' not in kw for _, kw in calls[2:]))
 
 
+class VendorReleaseTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.apps = Path(self.temp.name)
+        self.settings = patch.object(maintenance, 'APPLICATIONS', self.apps)
+        self.settings.start()
+        self.key = 'brew-cask:google-chrome'
+        self.release = {'version': '156.0.8078.48', 'source': 'https://example.invalid/test', 'channel': 'stable'}
+        self.write_app(self.key, '155.0.8059.85', '8059.85')
+
+    def tearDown(self):
+        self.settings.stop()
+        self.temp.cleanup()
+
+    def write_app(self, key, version, build, **extras):
+        filename, identifier = maintenance.VENDOR_APPS[key]
+        app = self.apps / filename
+        info = app / 'Contents/Info.plist'
+        info.parent.mkdir(parents=True, exist_ok=True)
+        info.write_bytes(plistlib.dumps(dict(CFBundleShortVersionString=version,
+                        CFBundleVersion=build, CFBundleIdentifier=identifier, **extras)))
+        if key == 'brew-cask:cursor':
+            product = app / 'Contents/Resources/app/product.json'
+            product.parent.mkdir(parents=True, exist_ok=True)
+            product.write_text('{"quality": "stable", "commit": "different-source-hash"}')
+        return app
+
+    def test_chrome_uses_full_marketing_version_not_incompatible_build(self):
+        self.assertEqual(maintenance.assess_vendor_release(self.key, self.release)['state'], 'update-available')
+        self.write_app(self.key, self.release['version'], '8078.48')
+        self.assertEqual(maintenance.assess_vendor_release(self.key, self.release)['state'], 'current')
+
+    def test_current_and_newer_apps_never_trigger_native_replacement(self):
+        for version, state in [('156.0.8078.48', 'current'), ('157.0.8000.1', 'newer')]:
+            self.write_app(self.key, version, 'unrelated-build')
+            with patch.object(maintenance, 'vendor_release', return_value=self.release), patch.object(maintenance, 'native_cask_update') as native:
+                result = maintenance.cask_update(self.key, False, io.StringIO(), None)
+            self.assertEqual(result['state'], state)
+            native.assert_not_called()
+
+    def test_outdated_running_app_is_confirmed_pending_and_not_replaced(self):
+        app = self.apps / 'Google Chrome.app'
+        calls = []
+        def command(args, log, **kwargs):
+            calls.append(args)
+            log.write('skipped: installed app is current, newer, or incomparable\n')
+        with patch.object(maintenance, 'vendor_release', return_value=self.release), patch.object(maintenance, 'cask_apps', return_value=[app]), patch.object(maintenance, 'is_running', return_value=True):
+            result = maintenance.cask_update(self.key, False, io.StringIO(), command)
+        self.assertEqual(result['state'], 'deferred-running-app')
+        self.assertEqual(result['plans'][0]['after'], self.release['version'])
+        self.assertTrue(all('--dry-run' in args for args in calls))
+
+    def test_native_metadata_lag_does_not_hide_vendor_update(self):
+        with patch.object(maintenance, 'vendor_release', return_value=self.release), patch.object(maintenance, 'native_cask_update', return_value={'state': 'current'}), patch.object(maintenance, 'is_running', return_value=False):
+            result = maintenance.cask_update(self.key, False, io.StringIO(), None)
+        self.assertEqual(result['state'], 'update-available')
+        self.assertIn('did not apply', result['notes'][0])
+
+    def test_success_rereads_installed_version(self):
+        def install(*args):
+            self.write_app(self.key, self.release['version'], '8078.48')
+            return {'state': 'success'}
+        with patch.object(maintenance, 'vendor_release', return_value=self.release), patch.object(maintenance, 'native_cask_update', side_effect=install):
+            result = maintenance.cask_update(self.key, False, io.StringIO(), None)
+        self.assertEqual(result['vendor_check']['state'], 'current')
+
+    def test_missing_app_preview_reports_install_without_claiming_current(self):
+        info = self.apps / 'Google Chrome.app/Contents/Info.plist'
+        info.unlink(); info.parent.rmdir(); info.parent.parent.rmdir()
+        with patch.object(maintenance, 'vendor_release', return_value=self.release), patch.object(maintenance, 'native_cask_update', return_value={'state': 'checked'}):
+            result = maintenance.cask_update(self.key, True, io.StringIO(), None)
+        self.assertEqual(result['state'], 'update-available')
+        self.assertIsNone(result['plans'][0]['before'])
+
+    def test_summary_shows_current_and_newer_without_ambiguous_warning(self):
+        self.write_app(self.key, self.release['version'], '8078.48')
+        assessment = maintenance.assess_vendor_release(self.key, self.release)
+        report = {'state': 'success', 'schema_version': 3, 'errors': [], 'changes': [],
+                  'results': {self.key: {'state': 'current', 'vendor_check': assessment},
+                              'brew-cask:cursor': {'state': 'newer', 'vendor_check':
+                                  dict(assessment, state='newer', installed='3.27.0', available='3.26.13')}}}
+        output = io.StringIO()
+        with redirect_stdout(output): maintenance.Console().summary(report)
+        self.assertIn('Chrome: current (156.0.8078.48)', output.getvalue())
+        self.assertIn('keeping newer app', output.getvalue())
+        self.assertNotIn('verification unavailable', output.getvalue())
+        self.assertNotIn('incomparable', output.getvalue())
+
+    def test_feed_failure_is_explicit_even_if_native_says_current(self):
+        with patch.object(maintenance, 'vendor_release', side_effect=RuntimeError('offline')), patch.object(maintenance, 'native_cask_update', return_value={'state': 'current'}):
+            result = maintenance.cask_update(self.key, False, io.StringIO(), None)
+        self.assertEqual(result['state'], 'availability-unknown')
+        self.assertEqual(result['vendor_check']['error'], 'offline')
+
+    def test_unsupported_formats_and_identities_preserve_the_app(self):
+        for version, identifier in [('156.0-preview', 'com.google.Chrome'), ('156.0.8078.48', 'unexpected.id')]:
+            app = self.write_app(self.key, version, '1')
+            info = app / 'Contents/Info.plist'
+            data = plistlib.loads(info.read_bytes()); data['CFBundleIdentifier'] = identifier
+            info.write_bytes(plistlib.dumps(data))
+            with patch.object(maintenance, 'vendor_release', return_value=self.release), patch.object(maintenance, 'native_cask_update') as native:
+                result = maintenance.cask_update(self.key, False, io.StringIO(), None)
+            self.assertEqual(result['state'], 'availability-unknown')
+            native.assert_not_called()
+        with self.assertRaisesRegex(ValueError, 'Incompatible'):
+            maintenance.compare_numeric_versions('155.1', '156.0.8078.48')
+
+    def test_chrome_filters_partial_and_ended_rollouts_and_empty_feed(self):
+        records = {'releases': [
+            {'version': '156.0.8078.48', 'fraction': 1, 'serving': {}},
+            {'version': '157.0.9000.1', 'fraction': 0.1},
+            {'version': '158.0.9000.1', 'fraction': 1, 'serving': {'endTime': 'past'}}]}
+        with patch.object(maintenance, 'json_url', return_value=records):
+            self.assertEqual(maintenance.vendor_release(self.key)['version'], '156.0.8078.48')
+        for records in ({'releases': []}, {'releases': [], 'nextPageToken': 'more'}):
+            with patch.object(maintenance, 'json_url', return_value=records), self.assertRaises(ValueError):
+                maintenance.vendor_release(self.key)
+
+    def test_cursor_stable_version_is_independent_of_artifact_hash(self):
+        key = 'brew-cask:cursor'
+        self.write_app(key, '3.26.13', '3.26.13')
+        payload = {'name': '3.26.13', 'url': 'https://downloads.cursor.com/production/' + 'a'*40 + '/darwin/arm64/Cursor-darwin-arm64.zip'}
+        with patch.object(maintenance.platform, 'machine', return_value='arm64'), patch.object(maintenance, 'json_url', return_value=payload) as fetch:
+            release = maintenance.vendor_release(key)
+        self.assertIn('/cursor/0.0.0/stable', fetch.call_args.args[0])
+        self.assertEqual(maintenance.assess_vendor_release(key, release)['state'], 'current')
+        payload['url'] = 'https://example.invalid/file.zip'
+        with patch.object(maintenance.platform, 'machine', return_value='arm64'), patch.object(maintenance, 'json_url', return_value=payload), self.assertRaises(ValueError):
+            maintenance.vendor_release(key)
+
+    def test_chatgpt_compares_same_version_builds_and_rejects_conflicts(self):
+        key = 'brew-cask:chatgpt'
+        release = dict(self.release, version='26.1013.40934', build='20770')
+        for build, state in [('20769', 'update-available'), ('20770', 'current'), ('20771', 'newer')]:
+            self.write_app(key, release['version'], build)
+            self.assertEqual(maintenance.assess_vendor_release(key, release)['state'], state)
+        self.write_app(key, '26.1014.40934', '20769')
+        with self.assertRaisesRegex(ValueError, 'disagree'):
+            maintenance.assess_vendor_release(key, release)
+
+    def test_appcast_selects_compatible_stable_build(self):
+        def item(version, build, extra=''):
+            return (f'<item><s:shortVersionString>{version}</s:shortVersionString>'
+                    f'<s:version>{build}</s:version>{extra}'
+                    f'<enclosure url="https://persistent.oaistatic.com/codex-app-prod/ChatGPT-darwin-arm64-{version}.zip"/></item>')
+        xml = ('<rss xmlns:s="http://www.andymatuschak.org/xml-namespaces/sparkle"><channel>' +
+               item('26.1013.40934', '20770', '<s:minimumSystemVersion>13.0</s:minimumSystemVersion>') +
+               item('26.1014.40934', '20771', '<s:channel>beta</s:channel>') +
+               item('26.1015.40934', '20772', '<s:minimumSystemVersion>99.0</s:minimumSystemVersion>') +
+               item('26.1016.40934', '20773', '<s:hardwareRequirements>x86_64</s:hardwareRequirements>') +
+               '</channel></rss>').encode()
+        with patch.object(maintenance.platform, 'machine', return_value='arm64'), patch.object(maintenance, 'read_command', return_value='26.0'), patch.object(maintenance, 'urlopen', return_value=io.BytesIO(xml)):
+            self.assertEqual(maintenance.vendor_release('brew-cask:chatgpt')['build'], '20770')
+        with patch.object(maintenance, 'read_command', return_value='26.0'), patch.object(maintenance, 'urlopen', return_value=io.BytesIO(b'<rss><channel/></rss>')), self.assertRaises(ValueError):
+            maintenance.vendor_release('brew-cask:chatgpt')
+
+    def test_preview_retains_vendor_plan_and_suppresses_only_resolved_warning(self):
+        fixture = MaintenanceOutputTests(); fixture.setUp()
+        try:
+            def command(args, log, **kwargs):
+                if 'outdated' in args: log.write('{}\n')
+                elif '--check' in args: log.write('{"files": [], "revisions": {}}\n')
+                elif 'brew-cask:google-chrome' in args:
+                    log.write('skipped: installed app is current, newer, or incomparable\n')
+                else: log.write('already up to date\n')
+            with patch.dict(maintenance.VENDOR_APPS, {self.key: ('Google Chrome.app', 'com.google.Chrome')}), patch.object(maintenance, 'vendor_release', return_value=self.release):
+                self.assertEqual(fixture.invoke(['--check', '--json'], command=command, running=True), 0)
+            report = json.loads(fixture.stdout.getvalue())
+            result = report['results'][self.key]
+            self.assertEqual(result['state'], 'update-available')
+            self.assertEqual(len(report['planned_changes']), 1)
+            self.assertNotIn('notes', result)
+            self.assertNotIn('plan_unverified', result)
+        finally:
+            fixture.tearDown()
+
+
 class MaintenanceOutputTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -203,10 +380,13 @@ class MaintenanceOutputTests(unittest.TestCase):
         self.settings.start()
         self.inventory_patch = patch.object(maintenance, 'inventory', return_value=({}, {}))
         self.inventory_patch.start()
+        self.vendor_patch = patch.dict(maintenance.VENDOR_APPS, {}, clear=True)
+        self.vendor_patch.start()
         self.stdout = io.StringIO()
         self.stderr = io.StringIO()
 
     def tearDown(self):
+        self.vendor_patch.stop()
         self.inventory_patch.stop()
         self.settings.stop()
         self.temp.cleanup()
