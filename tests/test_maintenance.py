@@ -9,6 +9,7 @@ import plistlib
 from pathlib import Path
 import tempfile
 import threading
+import time
 import sys
 import tomllib
 import unittest
@@ -114,6 +115,81 @@ class UpdateSafetyTests(unittest.TestCase):
         maintenance.atomic_write(link, 'after')
         self.assertTrue(link.is_symlink())
         self.assertEqual(source.read_text(), 'after')
+
+
+class DownloadProgressTests(unittest.TestCase):
+    def test_resumed_download_reports_bytes_and_stalls_without_discarding_data(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            partial = root / '.opera-2-id-setup.dmg.mise-part'
+            partial.write_bytes(b'a' * 1024)
+            Path(str(partial) + '.json').write_text('{"total_size": 4096}')
+            with patch.object(maintenance.time, 'monotonic', return_value=0) as clock:
+                progress = maintenance.CaskDownloadProgress('brew-cask:opera', root=root, idle_timeout=10)
+                self.assertEqual(progress(), '')  # Old cache alone is not live progress.
+                clock.return_value = 2
+                partial.write_bytes(b'a' * 2048)
+                self.assertIn('50%', progress())
+                clock.return_value = 4
+                partial.write_bytes(b'a' * 3072)
+                self.assertIn('75%', progress())
+                self.assertIn('KiB/s', progress())
+                clock.return_value = 15
+                with self.assertRaisesRegex(RuntimeError, 'no progress for 10s'):
+                    progress()
+                self.assertEqual(partial.stat().st_size, 3072)
+                partial.rename(root / 'finished.dmg')
+                self.assertEqual(progress(), '')
+
+    def test_other_apps_and_unknown_metadata_do_not_break_progress(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            progress = maintenance.CaskDownloadProgress('brew-cask:opera', root=root)
+            (root / '.spotify-2.dmg.mise-part').write_bytes(b'x')
+            self.assertEqual(progress(), '')
+            partial = root / '.opera-2.dmg.mise-part'
+            partial.write_bytes(b'x' * 1048576)
+            Path(str(partial) + '.json').write_text('incomplete')
+            self.assertEqual(progress(), 'Downloading 1.0 MiB')
+
+    def test_timeout_kills_descendants_in_quiet_and_verbose_modes(self):
+        for verbose in (False, True):
+            with self.subTest(verbose=verbose), tempfile.TemporaryDirectory() as temp:
+                marker = Path(temp) / 'orphan-survived'
+                child = f'import time; from pathlib import Path; time.sleep(1); Path({str(marker)!r}).write_text("bad")'
+                parent = ('import subprocess, sys, time; '
+                          f'subprocess.Popen([sys.executable, "-c", {child!r}]); '
+                          'time.sleep(30)')
+                with redirect_stderr(io.StringIO()):
+                    console = maintenance.Console(verbose=verbose)
+                with self.assertRaises(maintenance.subprocess.TimeoutExpired):
+                    maintenance.run([sys.executable, '-c', parent], io.StringIO(), timeout=0.3, console=console)
+                time.sleep(1.2)
+                self.assertFalse(marker.exists(), 'Updater child continued after timeout')
+
+    def test_quiet_interrupt_also_stops_process_group(self):
+        real_popen = maintenance.subprocess.Popen
+        processes = []
+        def spawn(*args, **kwargs):
+            process = real_popen(*args, **kwargs)
+            processes.append(process)
+            return process
+        with patch.object(maintenance.subprocess, 'Popen', side_effect=spawn), patch.object(maintenance.selectors.DefaultSelector, 'select', side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                maintenance.run([sys.executable, '-c', 'import time; time.sleep(30)'], io.StringIO())
+        self.assertIsNotNone(processes[0].poll())
+
+    def test_casks_bound_checks_and_updates_and_observe_downloads(self):
+        calls = []
+        def command(args, log, **kwargs):
+            calls.append((args, kwargs))
+            log.write('already up to date\n')
+        with patch.object(maintenance, 'cask_apps', return_value=[]):
+            maintenance.cask_update('brew-cask:opera', False, io.StringIO(), command)
+            maintenance.cask_update('brew-cask:opera', True, io.StringIO(), command)
+        self.assertEqual([kw['timeout'] for _, kw in calls], [1800, 1800, 120, 120])
+        self.assertTrue(all(isinstance(kw['progress'], maintenance.CaskDownloadProgress) for _, kw in calls[:2]))
+        self.assertTrue(all('progress' not in kw for _, kw in calls[2:]))
 
 
 class MaintenanceOutputTests(unittest.TestCase):

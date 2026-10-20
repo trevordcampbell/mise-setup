@@ -122,6 +122,7 @@ class Console:
         self._stop = threading.Event()
         self._thread = None
         self._width = 0
+        self.detail = ''
 
     def paint(self, text, code):
         return f'\033[{code}m{text}\033[0m' if self.color else text
@@ -132,6 +133,7 @@ class Console:
 
     def starting(self, name, check_only):
         self.stop_progress()
+        self.detail = ''
         if self.json_output:
             return
         if self.verbose:
@@ -143,7 +145,8 @@ class Console:
                 frames = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
                 index = 0
                 while not self._stop.is_set():
-                    text = f'{frames[index % len(frames)]} {label(name)} · {time.monotonic() - start:.1f}s'
+                    detail = f' · {self.detail}' if self.detail else ''
+                    text = f'{frames[index % len(frames)]} {label(name)}{detail} · {time.monotonic() - start:.1f}s'
                     columns = shutil.get_terminal_size((80, 24)).columns
                     text = text[:max(1, columns - 1)]
                     self.stdout.write('\r' + text.ljust(self._width))
@@ -269,51 +272,114 @@ class Console:
         self.say(self.paint(f"Detailed log: {report.get('log', str(LOG))}", '2'))
 
 
-def run(args, log, timeout=3600, console=None, env=None):
+class CaskDownloadProgress:
+    """Observe native resumable downloads; never modify Mise's cache or receipts."""
+    def __init__(self, key, *, root=None, idle_timeout=120):
+        self.root = root or HOME / 'Library/Caches/mise/system-brew/casks'
+        self.pattern = '.' + key.split(':', 1)[1] + '-*.mise-part'
+        self.idle_timeout = idle_timeout
+        self.previous = self.files()
+        self.active = None
+        self.last_activity = time.monotonic()
+        self.sample = None
+        self.speed = ''
+
+    def files(self):
+        records = {}
+        for path in self.root.glob(self.pattern):
+            try:
+                stat = path.stat()
+                records[path] = (stat.st_size, stat.st_mtime_ns)
+            except FileNotFoundError:
+                pass  # Native finalization can rename a file between glob and stat.
+        return records
+
+    def __call__(self):
+        current, stamp = self.files(), time.monotonic()
+        changed = [p for p, stat in current.items() if self.previous.get(p) != stat]
+        self.previous = current
+        if changed:
+            self.active = max(changed, key=lambda p: current[p][1])
+            self.last_activity = stamp
+        if self.active not in current:
+            self.sample, self.active, self.speed = None, None, ''
+            return ''
+        size = current[self.active][0]
+        if stamp - self.last_activity >= self.idle_timeout:
+            raise RuntimeError(f'Download made no progress for {self.idle_timeout}s; stopped updater. '
+                               'Partial download retained by Mise; retry maintenance later.')
+        if self.sample is None or size < self.sample[1]:
+            self.sample, self.speed = (stamp, size), ''
+        elif stamp - self.sample[0] >= 2:
+            rate = (size - self.sample[1]) / (stamp - self.sample[0]) / 1024
+            self.speed = f' · {rate:.0f} KiB/s'
+            self.sample = (stamp, size)
+        try:
+            total = json.loads(Path(str(self.active) + '.json').read_text())['total_size']
+            if not isinstance(total, int) or total <= 0 or size > total:
+                raise ValueError('Unknown download size')
+            amount = f'{size / total:.0%} ({size / 1048576:.1f}/{total / 1048576:.1f} MiB)'
+        except (OSError, ValueError, KeyError, TypeError):
+            amount = f'{size / 1048576:.1f} MiB'
+        return f'Downloading {amount}{self.speed}'
+
+
+def run(args, log, timeout=3600, console=None, env=None, progress=None):
     command = list(map(str, args))
     log.write(f'\n[{now()}] {" ".join(command)}\n')
     log.flush()
-    if console is None or not console.verbose:
-        result = subprocess.run(command, cwd=HOME, env=env or ENV,
-                                stdin=subprocess.DEVNULL, stdout=log,
-                                stderr=subprocess.STDOUT, timeout=timeout)
-        returncode = result.returncode
-    else:
+    verbose = console is not None and console.verbose
+    if console:
+        console.detail = ''
+    if verbose:
         # Stream to the terminal and keep the full log. A pipe avoids ANSI progress
         # controls in the saved log; selectors also handle output without newlines.
         print('$ ' + ' '.join(command), file=console.stderr, flush=True)
-        deadline = time.monotonic() + timeout
-        decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
-        with subprocess.Popen(command, cwd=HOME, env=env or ENV, stdin=subprocess.DEVNULL,
-                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                              start_new_session=True) as process:
-            try:
-                with selectors.DefaultSelector() as selector:
-                    selector.register(process.stdout, selectors.EVENT_READ)
-                    while selector.get_map():
-                        remaining = deadline - time.monotonic()
-                        if remaining <= 0:
-                            raise subprocess.TimeoutExpired(command, timeout)
-                        for key, _ in selector.select(min(remaining, 0.2)):
-                            chunk = os.read(key.fileobj.fileno(), 65536)
-                            if not chunk:
-                                selector.unregister(key.fileobj)
-                            text = decoder.decode(chunk, final=not chunk)
-                            log.write(text)
-                            log.flush()
+    # All modes use the same process group and deadline. Quiet mode must also
+    # kill descendants on interruption; subprocess.run only kills its direct child.
+    deadline = time.monotonic() + timeout
+    progress_logged = -float('inf')
+    decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
+    with subprocess.Popen(command, cwd=HOME, env=env or ENV, stdin=subprocess.DEVNULL,
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          start_new_session=True) as process:
+        try:
+            with selectors.DefaultSelector() as selector:
+                selector.register(process.stdout, selectors.EVENT_READ)
+                while selector.get_map():
+                    if progress:
+                        detail = progress()
+                        if console:
+                            console.detail = detail
+                        if detail and time.monotonic() - progress_logged >= 5:
+                            log.write(f'[{now()}] {detail}\n'); log.flush()
+                            if verbose:
+                                print(detail, file=console.stderr, flush=True)
+                            progress_logged = time.monotonic()
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(command, timeout)
+                    for key, _ in selector.select(min(remaining, 0.2)):
+                        chunk = os.read(key.fileobj.fileno(), 65536)
+                        if not chunk:
+                            selector.unregister(key.fileobj)
+                        text = decoder.decode(chunk, final=not chunk)
+                        log.write(text)
+                        log.flush()
+                        if verbose:
                             console.stderr.write(text)
                             console.stderr.flush()
-                    remaining = deadline - time.monotonic()
-                    returncode = process.wait(timeout=max(remaining, 0))
-            except BaseException:
-                # A timed-out or interrupted command must not continue updating
-                # in the background, including children holding the output pipe.
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                process.wait()
-                raise
+                remaining = deadline - time.monotonic()
+                returncode = process.wait(timeout=max(remaining, 0))
+        except BaseException:
+            # A timed-out or interrupted command must not continue updating
+            # in the background, including children holding the output pipe.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+            raise
     if returncode:
         raise RuntimeError(f'Command exited {returncode}: {" ".join(command)}')
 
@@ -686,16 +752,18 @@ def cask_update(key, check, log, command):
     start = log.tell()
     if check or running:
         if check:
-            command([MISE, 'bootstrap', 'packages', 'apply', key, '-y', '--dry-run'], log)
-        command([MISE, 'bootstrap', 'packages', 'upgrade', key, '-y', '--dry-run'], log)
+            command([MISE, 'bootstrap', 'packages', 'apply', key, '-y', '--dry-run'], log, timeout=120)
+        command([MISE, 'bootstrap', 'packages', 'upgrade', key, '-y', '--dry-run'], log, timeout=120)
         log.flush(); log.seek(start); text = log.read(); log.seek(0, 2)
         result = cask_result(text, running)
         if check:
             result['state'] = 'checked'
         return result
-    command([MISE, 'bootstrap', 'packages', 'apply', key, '-y'], log)
+    command([MISE, 'bootstrap', 'packages', 'apply', key, '-y'], log,
+            timeout=1800, progress=CaskDownloadProgress(key))
     start = log.tell()
-    command([MISE, 'bootstrap', 'packages', 'upgrade', key, '-y'], log)
+    command([MISE, 'bootstrap', 'packages', 'upgrade', key, '-y'], log,
+            timeout=1800, progress=CaskDownloadProgress(key))
     log.flush(); log.seek(start); text = log.read(); log.seek(0, 2)
     return cask_result(text, False)
 

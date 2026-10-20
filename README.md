@@ -20,7 +20,7 @@ Reproducible host setup for an Apple Silicon Mac. This repository is the live gl
    exec zsh -l
    ```
 
-`--adopt` clones the repository into `~/.config/mise`, so later commands read it as their global configuration. `--force-dotfiles` replaces existing shell startup files with this setup; review those files first when restoring onto a Mac with custom settings. An existing nonempty `~/.config/mise` that is not this repository must be reviewed and merged or moved aside before adoption. On an already adopted Mac, pull and reconcile the complete setup with `mise -C "$HOME" run setup:sync`. Local Git edits are preserved and reported, and missing native packages are installed before upgrades. You can also preview with `mise -C "$HOME" bootstrap --dry-run`; apply with `mise -C "$HOME" bootstrap --yes --skip-dirty`. Add `--update` to fast-forward the configuration checkout first.
+`--adopt` clones the repository into `~/.config/mise`, so later commands read it as their global configuration. `--force-dotfiles` replaces existing shell startup files with this setup; review those files first when restoring onto a Mac with custom settings. An existing nonempty `~/.config/mise` that is not this repository must be reviewed and merged or moved aside before adoption. On an already adopted Mac, pull and reconcile the complete setup with `mise run setup:sync`. Local Git edits are preserved and reported, and missing native packages are installed before upgrades. You can also preview with `mise -C "$HOME" bootstrap --dry-run`; apply with `mise -C "$HOME" bootstrap --yes --skip-dirty`. Add `--update` to fast-forward the configuration checkout first.
 
 Mise must live at `~/.local/bin/mise`, because the update jobs use that stable path. Initial native package setup may ask for administrator authentication to create `/opt/homebrew`. Tools are installed before the font hook and update jobs need them; the final bootstrap hook generates shell completions and configures a stable GitHub credential helper that survives gh upgrades.
 
@@ -59,7 +59,11 @@ mise run fonts:check
 mise run fonts:update
 ```
 
-Manual maintenance uses one animated progress line in a terminal, followed by a summary of actual installed changes, deferred apps, skipped items, and errors. Unchanged checks do not scroll past. Redirected output and scheduled jobs use a compact plain-text summary; terminal color honors `NO_COLOR`.
+The tasks are global: run `mise run maintenance:update` from any directory. The task switches to your home directory before launching the updater, and the updater strips inherited Mise overrides from its child environment so host maintenance uses your global setup. A project can override a task with the same name; `mise -C "$HOME" run maintenance:update` remains available to explicitly select the host task.
+
+Manual maintenance uses one animated progress line in a terminal, followed by a summary of actual installed changes, deferred apps, skipped items, and errors. Unchanged checks do not scroll past. Redirected output and scheduled jobs use a compact plain-text summary; terminal color honors `NO_COLOR`. Native app downloads show received/total MiB, percentage when known, and transfer speed by observing Mise’s resumable download cache. Progress is also saved to the detailed log every five seconds and streamed with `--verbose`. Existing inactive partial downloads are not displayed as live transfers.
+
+An active app download that stops writing for 120 seconds fails that app’s stage and lets other stages continue. App update commands have a 30-minute total limit; native app previews have a two-minute limit. Slow downloads that keep advancing can continue within the total limit. On timeout or Ctrl-C, both quiet and verbose modes stop the command’s process group, including child processes. Mise retains partial downloads for a later retry; the updater does not delete them or bypass native checksum checks. The detailed log identifies the command and progress preceding an error.
 
 The updater compares installed state before and after each stage: Mise and global tool versions, app versions/builds, all linked native package/dependency versions, repository commits, deployed font contents, and shell completion contents. It groups changed font styles by family and shows shortened commit/build hashes in the terminal. Full values and both state snapshots stay in the JSON report. Source-revision bookkeeping alone does not count as a font update. Shell completion regeneration is reported separately, even when its content stays identical.
 
@@ -69,15 +73,15 @@ Preview mode applies no updates. It uses Mise's structured `outdated` output for
 
 ```sh
 # Show every stage and underlying command output live, while also saving the log:
-mise -C "$HOME" run maintenance:update --verbose
+mise run maintenance:update --verbose
 
 # Emit a JSON report on stdout (suitable for redirecting or piping):
-mise -C "$HOME" run maintenance:update --json
-mise -C "$HOME" run maintenance:check --json
-mise -C "$HOME" run maintenance:status --json
+mise run maintenance:update --json
+mise run maintenance:check --json
+mise run maintenance:status --json
 
 # The status command displays the most recent update without running updates:
-mise -C "$HOME" run maintenance:status
+mise run maintenance:status
 ```
 
 `--verbose` and `--json` belong after the task name. They can be combined: the JSON report goes to stdout and command output goes to stderr. `changes` lists observed installed changes, `planned_changes` lists available updates, and each stage retains its `before`/`after` snapshots and any verification errors. Reports include `schema_version` of `3`; older reports are displayed without inventing change details. Preview mode also accepts `--verbose`, which exposes the underlying update plans. JSON stdout contains no progress messages or log-path trailer; the log path is included in the report. `last-run.json`, `last-check.json`, `last-manual.json`, and `last-scheduled.json` live in `~/.local/state/mise/maintenance/`; command output is kept in `~/Library/Logs/mise-maintenance.log`.
@@ -92,9 +96,9 @@ The most recent 60 reports (updates and previews) are retained under `history/`.
 The command log and both launchd output logs rotate at the start of maintenance after exceeding 5 MB, keeping one previous copy each. Launchd logs use copy-and-truncate rotation so their open file descriptors remain valid. Limits are applied between runs; an unusually verbose single run can exceed the threshold until the next invocation.
 
 ```sh
-mise -C "$HOME" run maintenance:health --json
-mise -C "$HOME" run maintenance:history --limit 20
-mise -C "$HOME" run maintenance:history --json
+mise run maintenance:health --json
+mise run maintenance:history --limit 20
+mise run maintenance:history --json
 ```
 
 ## Save configuration changes
@@ -109,7 +113,7 @@ dotfiles commit -m "Update host setup"
 dotfiles push
 ```
 
-Changes are not automatically committed or pushed. Review and push changes you want available on other machines, including additions made with `mise use -g`. Use `mise -C "$HOME" run setup:sync` on another already adopted Mac to pull and apply saved changes.
+Changes are not automatically committed or pushed. Review and push changes you want available on other machines, including additions made with `mise use -g`. Use `mise run setup:sync` on another already adopted Mac to pull and apply saved changes.
 
 Tokens, passwords, SSH keys, shell histories, recordings, and app data are not stored here. Keep machine-specific private shell settings in `~/.config/zsh/local.zsh`, which the Zsh startup file sources if present. GitHub authentication stays in GitHub CLI's local credential storage. Sign in with `mise exec -- gh auth login --hostname github.com --git-protocol https --web` when you want to push changes; reading and restoring this public repository works without authentication. This checkout uses GitHub's noreply commit identity to avoid exposing a personal email address. The previous public dotfiles repository remains a historical snapshot; this repository is now the active configuration.
 
