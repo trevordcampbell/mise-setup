@@ -2,7 +2,7 @@
 
 Reproducible host setup for an Apple Silicon Mac. This repository is the live global mise configuration at `~/.config/mise`. Development projects continue to use their devcontainers.
 
-`config.toml` declares nine tools, four native command-line packages, 19 desktop app casks, Poppins, MarkText, shell repositories, managed shell files, Google variable fonts, and automatic update jobs. Native packages use mise's built-in `brew` and `brew-cask` backends; a Homebrew installation or executable is not required. Native libraries are resolved automatically.
+`config.toml` declares ten tools, four native command-line packages, 22 desktop app casks, Poppins, MarkText, shell repositories, managed shell files, Google variable fonts, and automatic update jobs. Native packages use mise's built-in `brew` and `brew-cask` backends; a Homebrew installation or executable is not required. Native libraries are resolved automatically. Claude Code is the global `claude` tool from Mise’s registry; it does not depend on a global npm installation. Its background updater is disabled in the Mise environment so Mise handles updates. Claude Desktop and T3 Code retain their built-in app updaters and can be adopted without replacing their installed bundles. Blender is installed and upgraded through Mise’s native cask backend. Its release downloads use Blender’s official mirror service and retain the cask’s checksum verification.
 
 ## Restore on a new Mac
 

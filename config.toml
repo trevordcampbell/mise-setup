@@ -9,9 +9,15 @@ self_update.auto = true
 self_update.check_duration = "24h"
 minimum_release_age = "24h"
 
+[settings.url_replacements]
+# Blender’s official mirror service handles downloads when the primary CDN rejects them.
+"https://download.blender.org/release/" = "https://mirror.blender.org/release/"
+
 [env]
 # Prefer the Python interpreter supplied by mise when uv creates environments.
 UV_PYTHON_PREFERENCE = "system"
+# Let Mise update Claude Code instead of running a second background updater.
+DISABLE_AUTOUPDATER = "1"
 
 [tools]
 node = "latest"
@@ -24,6 +30,7 @@ gh = "latest"
 "cargo:zpl_toolchain_cli" = "latest"
 "github:skw398/scap" = { version = "latest", asset_pattern = "scap.zip" }
 uv = "latest"
+claude = "latest"
 
 [bootstrap.packages]
 # Deliberately installed tools; mise resolves their native library dependencies.
@@ -54,6 +61,9 @@ uv = "latest"
 "brew-cask:spotify" = { version = "latest", adopt = true }
 "brew-cask:ledger-wallet" = { version = "latest", adopt = true }
 "brew-cask:chatgpt" = { version = "latest", adopt = true }
+"brew-cask:claude" = { version = "latest", adopt = true }
+"brew-cask:t3-code" = { version = "latest", adopt = true }
+"brew-cask:blender" = "latest"
 "brew-cask:font-poppins" = { version = "latest", adopt = true }
 
 [bootstrap.services.mise-tool-update]
