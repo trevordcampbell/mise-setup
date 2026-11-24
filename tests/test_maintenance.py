@@ -275,8 +275,9 @@ class VendorReleaseTests(unittest.TestCase):
                                   dict(assessment, state='newer', installed='3.27.0', available='3.26.13')}}}
         output = io.StringIO()
         with redirect_stdout(output): maintenance.Console().summary(report)
-        self.assertIn('Chrome: current (156.0.8078.48)', output.getvalue())
-        self.assertIn('keeping newer app', output.getvalue())
+        self.assertNotIn('Chrome', output.getvalue())
+        self.assertNotIn('Cursor', output.getvalue())
+        self.assertEqual(report['results']['brew-cask:cursor']['vendor_check']['available'], '3.26.13')
         self.assertNotIn('verification unavailable', output.getvalue())
         self.assertNotIn('incomparable', output.getvalue())
 
@@ -369,6 +370,61 @@ class VendorReleaseTests(unittest.TestCase):
             fixture.tearDown()
 
 
+class AuditTests(unittest.TestCase):
+    finding = {'tool': 'python', 'version': '3.15.2', 'id': 'CVE-example', 'summary': 'Cookie policy',
+               'severity': None, 'fixed': []}
+    unchecked = [{'tool': 'rust', 'version': '1.0'}]
+
+    def audit(self, code, stdout, stderr=''):
+        result = maintenance.subprocess.CompletedProcess([], code, stdout, stderr)
+        log = io.StringIO()
+        with patch.object(maintenance.subprocess, 'run', return_value=result) as cmd:
+            report = maintenance.audit_tools(log, maintenance.Console())
+        self.assertEqual(cmd.call_args.args[0], [str(maintenance.MISE), '-C', str(maintenance.HOME), 'audit', '--json'])
+        self.assertIn(stdout, log.getvalue())
+        return report
+
+    def test_clean_and_positive_exits_preserve_checked_time_and_scope(self):
+        for code, findings, state in [(0, [], 'clear'), (1, [self.finding], 'advisories')]:
+            with self.subTest(code=code):
+                result = self.audit(code, json.dumps({'vulnerabilities': findings, 'unchecked': self.unchecked}))
+                self.assertEqual(result['state'], state)
+                self.assertEqual(result['vulnerabilities'], findings)
+                self.assertEqual(result['unchecked'], self.unchecked)
+                self.assertIn('checked_at', result)
+
+    def test_failures_and_inconsistent_reports_cannot_pass_as_clean(self):
+        empty = json.dumps({'vulnerabilities': [], 'unchecked': []})
+        cases = [(1, '', 'mise ERROR could not reach OSV'), (2, empty, 'service failure'), (1, empty, ''),
+                 (0, '{}', ''), (0, 'not JSON', ''),
+                 (1, json.dumps({'vulnerabilities': [{}], 'unchecked': []}), ''),
+                 (0, json.dumps({'vulnerabilities': [], 'unchecked': ['rust']}), '')]
+        for args in cases:
+            with self.subTest(args=args), self.assertRaisesRegex(RuntimeError, 'Audit unavailable'):
+                self.audit(*args)
+
+    def test_summary_uses_one_row_per_decision_even_for_old_reports(self):
+        pending = {'name': 'Google Chrome', 'before': '1', 'after': '2', 'kind': 'version',
+                   'stage': 'brew-cask:google-chrome'}
+        report = {'state': 'success', 'schema_version': 3, 'changes': [], 'planned_changes': [pending],
+                  'results': {'brew-cask:google-chrome': {'state': 'deferred-running-app', 'plans': [pending],
+                              'vendor_check': {'state': 'update-available', 'installed': '1', 'available': '2'}},
+                              'brew-cask:claude': {'state': 'deferred-running-app',
+                              'notes': [' installed app is running and updates itself']},
+                              'brew-cask:orbstack': {'state': 'availability-unknown', 'notes': [
+                                  'installed app is current, newer, or incomparable']},
+                              'audit': {'state': 'advisories', 'vulnerabilities': [dict(self.finding, fixed=['3.15.3'])],
+                                        'unchecked': self.unchecked}}}
+        output = io.StringIO()
+        with redirect_stdout(output):
+            maintenance.Console().summary(report)
+        text = output.getvalue()
+        for phrase in ('Google Chrome', 'close the app', 'OrbStack', 'CVE-example', '3.15.3', 'Rust'):
+            self.assertEqual(text.count(phrase), 1, text)
+        self.assertNotIn('incomparable', text)
+        self.assertNotIn('Claude Desktop', text)
+
+
 class MaintenanceOutputTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -382,10 +438,14 @@ class MaintenanceOutputTests(unittest.TestCase):
         self.inventory_patch.start()
         self.vendor_patch = patch.dict(maintenance.VENDOR_APPS, {}, clear=True)
         self.vendor_patch.start()
+        self.audit = patch.object(maintenance, 'audit_tools', return_value={
+            'state': 'clear', 'vulnerabilities': [], 'unchecked': [], 'checked_at': maintenance.now()})
+        self.mock_audit = self.audit.start()
         self.stdout = io.StringIO()
         self.stderr = io.StringIO()
 
     def tearDown(self):
+        self.audit.stop()
         self.vendor_patch.stop()
         self.inventory_patch.stop()
         self.settings.stop()
@@ -407,8 +467,6 @@ class MaintenanceOutputTests(unittest.TestCase):
         calls = []
         def command(args, log, **kwargs):
             calls.append(list(map(str, args)))
-            if 'upgrade' in args:
-                self.assertIn('Running maintenance updates', self.stdout.getvalue())
             if 'upgrade' in args and '--global' in args:
                 raise RuntimeError('simulated update failure')
             if '--dry-run' in args:
@@ -417,13 +475,36 @@ class MaintenanceOutputTests(unittest.TestCase):
         output = self.stdout.getvalue()
         self.assertIn('Global tools: simulated update failure', output)
         self.assertNotIn('MarkText: Current', output)
-        self.assertIn('Deferred while running', output)
-        self.assertIn('Google Chrome', output)
-        self.assertIn('1 error · 1 deferred', output)
+        self.assertNotIn('close the app', output)
+        self.assertNotIn('Google Chrome', output)
+        self.assertIn('1 error', output)
         report = json.loads((self.state / 'last-run.json').read_text())
         self.assertEqual(report['errors'], ['tools'])
         self.assertIn('elapsed_seconds', report['results']['tools'])
         self.assertTrue(any('shell:completions' in call for call in calls))
+
+    def test_audit_is_persisted_for_manual_scheduled_and_preview_runs(self):
+        finding = AuditTests.finding
+        self.mock_audit.return_value = {'state': 'advisories', 'vulnerabilities': [finding], 'unchecked': []}
+        for args, filename in [([], 'last-manual'), (['--scheduled'], 'last-scheduled'), (['--check'], 'last-check')]:
+            with self.subTest(args=args):
+                self.stdout.seek(0)
+                self.stdout.truncate()
+                self.assertEqual(self.invoke(args + ['--json']), 0)
+                report = json.loads(self.stdout.getvalue())
+                self.assertLess(list(report['results']).index('tools'), list(report['results']).index('audit'))
+                self.assertEqual(report, maintenance.load_report(self.state / (filename + '.json')))
+                self.assertEqual(report['results']['audit']['vulnerabilities'], [finding])
+                self.assertEqual(report['errors'], [])
+
+    def test_unavailable_audit_is_an_error_and_later_checks_continue(self):
+        self.mock_audit.side_effect = RuntimeError('Audit unavailable. OSV offline')
+        self.assertEqual(self.invoke([]), 1)
+        report = maintenance.load_report(self.state / 'last-run.json')
+        self.assertEqual(report['errors'], ['audit'])
+        self.assertIn('marktext', report['results'])
+        self.assertIn('OSV offline', self.stdout.getvalue())
+        self.assertNotIn('0 advisories', self.stdout.getvalue())
 
     def test_json_stdout_is_exactly_the_saved_report(self):
         self.assertEqual(self.invoke(['--json']), 0)
@@ -438,7 +519,7 @@ class MaintenanceOutputTests(unittest.TestCase):
         output = self.stdout.getvalue()
         self.assertNotIn('Checking Global tools', output)
         self.assertNotIn('Google Chrome: Check completed', output)
-        self.assertIn('No changes applied — preview only.', output)
+        self.assertIn('Preview only. No updates applied.', output)
         self.assertNotIn('Updated to', output)
         self.assertTrue((self.state / 'last-check.json').exists())
         self.assertFalse((self.state / 'last-run.json').exists())
@@ -453,7 +534,7 @@ class MaintenanceOutputTests(unittest.TestCase):
         with redirect_stdout(self.stdout), patch.object(maintenance, 'run') as command:
             self.assertEqual(maintenance.main(['--status']), 0)
         command.assert_not_called()
-        self.assertIn('Maintenance finished in 2.0s', self.stdout.getvalue())
+        self.assertIn('Maintenance complete  2.0s', self.stdout.getvalue())
 
     def test_lock_contention_still_emits_valid_json(self):
         self.state.mkdir()
@@ -567,8 +648,8 @@ class ChangeReportingTests(unittest.TestCase):
                   'results': {'tools': {'state': 'success'}, 'shell-completions': {'state': 'success', 'changes': []}},
                   'changes': [], 'planned_changes': [], 'errors': []}
         console.summary(report)
-        self.assertIn('No installed versions or contents changed.', output.getvalue())
-        self.assertIn('Shell completions regenerated (content unchanged).', output.getvalue())
+        self.assertIn('No changes this run.', output.getvalue())
+        self.assertNotIn('completions', output.getvalue())
         self.assertNotIn('Global tools', output.getvalue())
         self.assertLess(len(output.getvalue().splitlines()), 12)
 
@@ -583,7 +664,7 @@ class ChangeReportingTests(unittest.TestCase):
         text = output.getvalue()
         self.assertIn('Node.js: 26.1 → 26.2', text)
         self.assertIn('partial results', text)
-        self.assertIn('Change verification unavailable', text)
+        self.assertIn('Check coverage', text)
         self.assertNotIn('No installed versions', text)
 
     def test_unknown_native_preview_does_not_claim_nothing_available(self):
@@ -806,7 +887,7 @@ class SyncHealthHistoryTests(unittest.TestCase):
         self.assertEqual(changes[0]['name'], 'uv')
         report = {'state': 'success', 'schema_version': 3, 'results': {}, 'errors': [], 'changes': [], 'since_previous_run': changes}
         with redirect_stdout(self.fixture.stdout): maintenance.Console().summary(report)
-        self.assertIn('outside this run', self.fixture.stdout.getvalue())
+        self.assertIn('Changed before this run', self.fixture.stdout.getvalue())
 
     def test_removed_declaration_is_not_reported_as_app_uninstall(self):
         previous = {'inventory_after': {'brew-cask:example/app': maintenance.entity('Example', '1', stage='brew-cask:example')}}
@@ -815,7 +896,7 @@ class SyncHealthHistoryTests(unittest.TestCase):
     def test_running_current_pending_and_unknown_are_distinct(self):
         self.assertEqual(maintenance.cask_result('already up to date', True)['state'], 'current')
         self.assertEqual(maintenance.cask_result('install cask test/2.0', True)['state'], 'deferred-running-app')
-        self.assertEqual(maintenance.cask_result('skipped: installed app is running and updates itself', True)['availability'], 'confirmed')
+        self.assertEqual(maintenance.cask_result('skipped: installed app is running and updates itself', True)['state'], 'self-updating')
         self.assertEqual(maintenance.cask_result('skipped: installed app is current, newer, or incomparable', True)['state'], 'availability-unknown')
         self.assertEqual(maintenance.cask_result('unrecognized output', True)['state'], 'availability-unknown')
 
@@ -823,12 +904,13 @@ class SyncHealthHistoryTests(unittest.TestCase):
         def command(args, log, **kwargs):
             if 'google-chrome' in ' '.join(map(str, args)):
                 self.assertIn('--dry-run', args)
-                log.write('skipped: installed app is running and updates itself\n')
+                log.write('install cask google-chrome/156.0.1\n')
         for i in range(2):
             self.fixture.stdout.seek(0);self.fixture.stdout.truncate()
             self.assertEqual(self.fixture.invoke(['--json'], command=command, running=True), 0)
         result = maintenance.load_report(maintenance.STATE / 'last-run.json')['results']['brew-cask:google-chrome']
         self.assertEqual(result['consecutive_deferrals'], 2)
+        self.assertEqual(result['plans'][0]['after'], '156.0.1')
         self.assertIn('deferred_since', result)
 
 

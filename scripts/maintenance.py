@@ -18,6 +18,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import threading
 import tomllib
@@ -69,14 +70,17 @@ def label(name):
         'devutils': 'DevUtils', 'macs-fan-control': 'Macs Fan Control',
         'font-poppins': 'Poppins fonts', 'node': 'Node.js', 'python': 'Python',
         'gh': 'GitHub CLI', 'cargo:zpl_toolchain_cli': 'ZPL toolchain',
+        'brew-cask:claude': 'Claude Desktop', 'claude': 'Claude Code', 'audit': 'Security audit',
         'github:skw398/scap': 'Scap', 'uv': 'uv', 'pnpm': 'pnpm',
     }
-    name = name.removeprefix('brew-cask:').removeprefix('brew:')
-    return labels.get(name, name.replace('-', ' ').title())
+    short = name.removeprefix('brew-cask:').removeprefix('brew:')
+    return labels.get(name) or labels.get(short, short.replace('-', ' ').title())
 
 
 def format_change(change, *, planned=False):
     name, kind = change['name'], change['kind']
+    if name == '.oh-my-zsh':
+        name = 'Oh My Zsh'
     old, new = change.get('before'), change.get('after')
     if kind in ('font', 'content') and planned:
         return f'{name}: update available'
@@ -100,6 +104,11 @@ def outcome(result):
     state = result['state']
     if state in ('failed', 'interrupted'):
         return '✗', result.get('error', 'Failed'), '31'
+    if state in ('clear', 'advisories'):
+        count = len(result['vulnerabilities'])
+        return ('!', plural(count, 'advisory', 'advisories'), '33') if count else ('✓', 'No known advisories for checked tools', '32')
+    if state == 'self-updating':
+        return '·', 'Uses its own updater while open', '2'
     if state == 'deferred-running-app':
         return '↷', 'Deferred — app is running', '33'
     if result.get('changes'):
@@ -118,6 +127,31 @@ def outcome(result):
     return '✓', 'Unchanged' if result.get('before') is not None else 'Check completed', '32'
 
 
+def plural(count, singular, multiple=None):
+    return f'{count} {singular if count == 1 else multiple or singular + "s"}'
+
+
+def changed_rows(changes):
+    rows, families = [], {}
+    for change in changes:
+        if change['kind'] != 'font':
+            rows.append(format_change(change))
+            continue
+        family = next((name for prefix, name in [('Poppins', 'Poppins'), ('OpenSans', 'Open Sans'),
+                      ('Rubik', 'Rubik'), ('SpaceGrotesk', 'Space Grotesk')] if change['name'].startswith(prefix)), change['name'])
+        families.setdefault(family, []).append(change.get('action', 'updated'))
+    for name, actions in families.items():
+        verb = actions[0] if len(set(actions)) == 1 else 'changed'
+        rows.append(f"{name}: {plural(len(actions), 'font file')} {verb}")
+    return rows
+
+
+def plain(text):
+    # Prevent terminal controls in upstream diagnostics from affecting the layout.
+    text = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', str(text))
+    return ' '.join(''.join(c if c.isprintable() else ' ' for c in text).split())
+
+
 class Console:
     def __init__(self, *, verbose=False, json_output=False):
         self.verbose, self.json_output = verbose, json_output
@@ -127,6 +161,7 @@ class Console:
         self._stop = threading.Event()
         self._thread = None
         self._width = 0
+        self.completed_steps = 0
         self.detail = ''
 
     def paint(self, text, code):
@@ -151,10 +186,10 @@ class Console:
                 index = 0
                 while not self._stop.is_set():
                     detail = f' · {self.detail}' if self.detail else ''
-                    text = f'{frames[index % len(frames)]} {label(name)}{detail} · {time.monotonic() - start:.1f}s'
+                    text = f'{frames[index % len(frames)]} Step {self.completed_steps + 1} · {label(name)}{detail}  {time.monotonic() - start:.0f}s'
                     columns = shutil.get_terminal_size((80, 24)).columns
                     text = text[:max(1, columns - 1)]
-                    self.stdout.write('\r' + text.ljust(self._width))
+                    self.stdout.write('\r\033[2K' + text)
                     self.stdout.flush()
                     self._width = len(text)
                     index += 1
@@ -168,12 +203,13 @@ class Console:
             self._thread.join()
             self._thread = None
         if self._width:
-            self.stdout.write('\r' + ' ' * self._width + '\r')
+            self.stdout.write('\r\033[2K')
             self.stdout.flush()
             self._width = 0
 
     def finished(self, name, result):
         self.stop_progress()
+        self.completed_steps += 1
         if self.verbose:
             symbol, detail, color = outcome(result)
             elapsed = f"  {result['elapsed_seconds']:.1f}s" if 'elapsed_seconds' in result else ''
@@ -197,97 +233,115 @@ class Console:
                 for name, result in report.get('results', {}).items():
                     self.finished(name, result)
         results = report.get('results', {})
-        failed = [name for name, r in results.items() if r['state'] in ('failed', 'interrupted')]
-        deferred = [name for name, r in results.items() if r['state'] == 'deferred-running-app']
-        unverified = [name for name, r in results.items() if r.get('observation_errors') or r.get('plan_unverified') or r.get('state') == 'availability-unknown' or r.get('vendor_check', {}).get('state') == 'unverified']
-        changes = report.get('changes', [])
+        failures, security, waiting, limits, notes, available = [], [], [], [], [], []
         plans = report.get('planned_changes', [])
-        notes = [(name, note) for name, r in results.items() for note in r.get('notes', [])]
+        preview = report.get('check_only', False)
+        for name, result in results.items():
+            title, state = label(name), result['state']
+            vendor = result.get('vendor_check', {})
+            stage_plans = [p for p in plans if p.get('stage') == name] or result.get('plans', [])
+            messages = [msg.strip() for msg in result.get('notes', [])]
+            # Older reports counted a running self-updater as a confirmed deferral.
+            self_updating = state == 'self-updating' or (state in ('checked', 'deferred-running-app') and not stage_plans
+                            and not vendor and 'installed app is running and updates itself' in messages)
+            if state in ('failed', 'interrupted'):
+                failures.append(f"{title}: {result.get('error', 'Failed')}")
+            elif self_updating:
+                if self.verbose:
+                    notes.append(f'{title} uses its own updater while open.')
+            elif state == 'deferred-running-app':
+                target = ', '.join(format_change(p, planned=True) for p in stage_plans) or title
+                waiting.append(f'{target} — close the app before the next run.')
+            else:
+                available.extend(format_change(p, planned=True) for p in stage_plans)
+            ambiguous = 'installed app is current, newer, or incomparable' in messages and not stage_plans and not vendor
+            if ambiguous or state == 'availability-unknown' or result.get('plan_unverified') or vendor.get('state') == 'unverified':
+                reason = vendor.get('error') or 'Mise could not confirm whether an update is available.'
+                limits.append(f'{title}: {reason}')
+            if result.get('observation_errors'):
+                limits.append(f"{title}: change verification incomplete ({', '.join(result['observation_errors'])}).")
+            for note in messages:
+                if note in ('installed app is running and updates itself', 'installed app is current, newer, or incomparable',
+                            'Native check could not prove an eligible update; see the detailed log.') or (
+                            note.startswith('Official vendor check unavailable:') and vendor.get('error')):
+                    continue
+                hold = re.fullmatch(r'newer (.+?) release (\S+) \(released .+?, eligible (.+?)\) ignored by minimum_release_age .*', note)
+                if hold:
+                    waiting.append(f'{label(hold[1])} {hold[2]} becomes eligible {hold[3]}.')
+                else:
+                    notes.append(f'{title}: {note}')
+        available.extend(format_change(p, planned=True) for p in plans if p.get('stage') not in results)
+        if report.get('inventory_errors_before') or report.get('inventory_errors_after'):
+            for stage in sorted(set(report.get('inventory_errors_before', {})) | set(report.get('inventory_errors_after', {}))):
+                if not results.get(stage, {}).get('observation_errors'):
+                    limits.append(f'{label(stage)}: incomplete inventory for comparisons between runs.')
+
+        audit = results.get('audit', {})
+        for finding in audit.get('vulnerabilities', []):
+            fixes = ', '.join(finding.get('fixed', []))
+            advice = f'Fix listed in {fixes}. Check for an eligible update.' if fixes else 'No fixed version listed. Maintenance will recheck.'
+            severity = f" · {finding['severity']}" if finding.get('severity') else ''
+            description = finding['summary'].replace('`', '').rstrip('.')
+            security.append((f"{label(finding['tool'])} {finding['version']}  ·  {finding['id']}{severity}",
+                             f"{description}. {advice}"))
+        unchecked = ', '.join(label(item['tool']) for item in audit.get('unchecked', []))
+        if unchecked:
+            limits.append(f'No advisory source for {unchecked}.')
         elapsed = report.get('elapsed_seconds')
         if elapsed is None and report.get('finished_at') and report.get('started_at'):
             elapsed = (datetime.fromisoformat(report['finished_at']) - datetime.fromisoformat(report['started_at'])).total_seconds()
-        duration = f' in {elapsed:.1f}s' if elapsed is not None else ''
-        preview = report.get('check_only', False)
-        good = report['state'] == 'success'
-        status = 'interrupted' if report['state'] == 'interrupted' else 'finished' if good else 'finished with errors'
-        self.say()
-        self.say(self.paint(f"{'✓' if good else '✗'} {'Preview' if preview else 'Maintenance'} {status}{duration}", '32' if good else '31'))
-        self.say()
-        if changes:
-            self.say(self.paint(('Observed changes during preview' if preview else 'Installed changes') + (' (including partial results)' if failed else ''), '1'))
-            font_groups = {}
-            for change in changes:
-                if change['kind'] == 'font':
-                    family = next((display for prefix, display in [('Poppins', 'Poppins'), ('OpenSans', 'Open Sans'), ('Rubik', 'Rubik'), ('SpaceGrotesk', 'Space Grotesk')] if change['name'].startswith(prefix)), change['name'])
-                    font_groups.setdefault(family, []).append(change)
-                else:
-                    self.say('  ' + format_change(change))
-            for family, files in font_groups.items():
-                actions = set(c.get('action', 'updated') for c in files)
-                action = next(iter(actions)) if len(actions) == 1 else 'changed'
-                self.say(f"  {family}: {len(files)} font {'file' if len(files) == 1 else 'files'} {action}")
-        elif report.get('schema_version', 0) < 2:
-            self.say('This older report did not record before/after changes.')
-        elif failed or unverified:
-            self.say('No changes verified; some results could not be confirmed.')
-        elif preview:
-            self.say('No changes applied — preview only.')
+        changes = report.get('changes', [])
+        title = 'Update preview' if preview else 'Maintenance'
+        if report['state'] == 'interrupted':
+            title, color = title + ' interrupted', '31'
+        elif failures or report['state'] == 'failed':
+            title, color = title + ' finished with errors', '31'
+        elif security or limits or waiting:
+            title, color = title + ' complete', '36'
         else:
-            self.say('No installed versions or contents changed.')
-        if report.get('since_previous_run'):
-            self.say()
-            self.say(self.paint('Changed since the previous run (outside this run)', '1'))
-            for change in report['since_previous_run']:
-                self.say('  ' + format_change(change))
-        if plans:
-            self.say()
-            self.say(self.paint('Updates available (not applied)', '1'))
-            for plan in plans:
-                self.say('  ' + format_change(plan, planned=True))
-        elif preview and not unverified and not failed:
-            self.say('No tool, app, package, or font updates were reported by the preview.')
-        activity = results.get('shell-completions', {})
-        if activity.get('state') == 'success':
-            detail = 'change not verified' if activity.get('observation_errors') else 'change details not recorded' if report.get('schema_version', 0) < 2 else 'content unchanged' if not activity.get('changes') else 'content updated'
-            self.say(f'Shell completions regenerated ({detail}).')
-        if deferred:
-            self.say()
-            self.say(self.paint('Deferred while running', '33'))
-            for name in deferred:
-                count = results[name].get('consecutive_deferrals', 1)
-                self.say(f"  {label(name)}: update pending — close and retry" + (f' ({count} consecutive runs)' if count > 1 else ''))
-        verified_apps = [(name, r['vendor_check']) for name, r in results.items()
-                         if r.get('vendor_check', {}).get('state') in ('current', 'newer', 'update-available')]
-        if verified_apps:
-            self.say()
-            self.say(self.paint('Official stable release checks', '1'))
-            for name, vendor in verified_apps:
-                if vendor['state'] == 'current':
-                    detail = f"current ({vendor['installed']})"
-                elif vendor['state'] == 'newer':
-                    detail = f"installed {vendor['installed']}; stable feed {vendor['available']} — keeping newer app"
-                else:
-                    detail = f"{vendor['installed']} → {vendor['available']} available"
-                self.say(f'  {label(name)}: {detail}')
-        if notes:
-            self.say()
-            self.say(self.paint('Skipped or noted', '33'))
-            for name, note in notes:
-                self.say(f'  {label(name)}: {note}')
-        if unverified:
-            self.say()
-            self.say(self.paint('Change verification unavailable', '33'))
-            for name in unverified:
-                detail = '; '.join(results[name].get('observation_errors', [])) or results[name].get('vendor_check', {}).get('error') or 'See the native plan in the detailed log.'
-                self.say(f'  {label(name)}: {detail}')
-        if failed:
-            self.say()
-            self.say(self.paint('Errors', '31'))
-            for name in failed:
-                self.say(f"  {label(name)}: {results[name].get('error', 'Failed')}")
+            title, color = title + ' complete', '32'
+        self.say(self.paint(title, '1;' + color) + (f'  {elapsed:.1f}s' if elapsed is not None else ''))
+        counts = [plural(len(results) - len(failures), 'step') + ' completed', plural(len(failures), 'error')]
+        if audit.get('state') in ('clear', 'advisories'):
+            counts.append(plural(len(security), 'advisory', 'advisories'))
+        elif not audit and report.get('schema_version', 0) >= 4:
+            counts.append('audit did not run')
+        self.say(' · '.join(counts))
+        if report.get('schema_version', 0) < 2:
+            self.say('This older report did not record installed changes.')
+        elif preview:
+            self.say('Preview only. No updates applied.')
+        elif not changes:
+            incomplete = failures or report.get('inventory_errors_before') or report.get('inventory_errors_after') or any(
+                r.get('observation_errors') for r in results.values())
+            self.say('No changes verified.' if incomplete else 'No changes this run.')
+        self.section('Failed', failures, '31')
+        self.section('Security advisories', security, '33')
+        self.section('Waiting', waiting, '33')
+        self.section('Available to update', available, '1')
+        heading = 'Observed during preview' if preview else 'Changed this run'
+        self.section(heading + (' (partial results)' if failures else ''), changed_rows(changes), '32')
+        self.section('Changed before this run', changed_rows(report.get('since_previous_run', [])), '1')
+        self.section('Check coverage', limits, '33')
+        self.section('Other notes', notes, '2')
+        if failures or self.verbose:
+            self.say(self.paint(f"Log  {report.get('log', str(LOG))}", '2'))
+
+    def section(self, heading, rows, color):
+        if not rows:
+            return
         self.say()
-        self.say(f"{len(failed)} {'error' if len(failed) == 1 else 'errors'} · {len(deferred)} deferred")
-        self.say(self.paint(f"Detailed log: {report.get('log', str(LOG))}", '2'))
+        self.say(self.paint(heading, color))
+        width = max(20, min(96, shutil.get_terminal_size((88, 24)).columns - 1))
+        for row in dict.fromkeys(rows):
+            if isinstance(row, tuple):
+                title, detail = row
+                self.say(textwrap.fill(plain(title), width=width, initial_indent='  ', subsequent_indent='    '))
+                indent = '    '
+            else:
+                detail, indent = row, '  '
+            self.say(textwrap.fill(plain(detail), width=width, initial_indent=indent,
+                                   subsequent_indent='    ', break_on_hyphens=False))
 
 
 class CaskDownloadProgress:
@@ -358,6 +412,7 @@ def run(args, log, timeout=3600, console=None, env=None, progress=None):
     deadline = time.monotonic() + timeout
     progress_logged = -float('inf')
     decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
+    output_tail = ''
     with subprocess.Popen(command, cwd=HOME, env=env or ENV, stdin=subprocess.DEVNULL,
                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                           start_new_session=True) as process:
@@ -382,6 +437,7 @@ def run(args, log, timeout=3600, console=None, env=None, progress=None):
                         if not chunk:
                             selector.unregister(key.fileobj)
                         text = decoder.decode(chunk, final=not chunk)
+                        output_tail = (output_tail + text)[-4096:]
                         log.write(text)
                         log.flush()
                         if verbose:
@@ -399,7 +455,44 @@ def run(args, log, timeout=3600, console=None, env=None, progress=None):
             process.wait()
             raise
     if returncode:
-        raise RuntimeError(f'Command exited {returncode}: {" ".join(command)}')
+        lines = [plain(line) for line in output_tail.splitlines() if line.strip()]
+        detail = next((line for line in reversed(lines) if re.search(r'error|failed|denied', line, re.I)
+                       and 'verbose' not in line.lower()), lines[-1] if lines else Path(command[0]).name)
+        raise RuntimeError(f'Command exited {returncode}. {detail}')
+
+
+def audit_tools(log, console):
+    """Keep audit exit 1 with a valid finding distinct from an OSV or CLI failure."""
+    cmd = [str(MISE), '-C', str(HOME), 'audit', '--json']
+    log.write(f'\n[{now()}] {" ".join(cmd)}\n')
+    if console.verbose:
+        print('$ ' + ' '.join(cmd), file=console.stderr, flush=True)
+    completed = subprocess.run(cmd, cwd=HOME, env=ENV, stdin=subprocess.DEVNULL,
+                               capture_output=True, text=True, timeout=120)
+    for stream in (completed.stderr, completed.stdout):
+        log.write(stream)
+        if console.verbose and stream:
+            print(stream, end='', file=console.stderr, flush=True)
+    try:
+        data = json.loads(completed.stdout)
+        findings, unchecked = data['vulnerabilities'], data['unchecked']
+        if not isinstance(findings, list) or not isinstance(unchecked, list):
+            raise ValueError('expected advisory and coverage lists')
+        for row in findings + unchecked:
+            if not all(isinstance(row[k], str) and row[k] for k in ('tool', 'version')):
+                raise ValueError('missing tool or version')
+        for row in findings:
+            if not all(isinstance(row[k], str) and row[k] for k in ('id', 'summary')):
+                raise ValueError('missing advisory ID or summary')
+            if not isinstance(row['fixed'], list) or not all(isinstance(v, str) for v in row['fixed']):
+                raise ValueError('invalid fixed versions')
+        if completed.returncode != int(bool(findings)):
+            raise ValueError('exit status disagrees with the reported findings')
+    except (ValueError, TypeError, KeyError) as error:
+        detail = next((line for line in completed.stderr.splitlines() if 'ERROR' in line), completed.stderr.strip())
+        raise RuntimeError(f'Audit unavailable (exit {completed.returncode}). {plain(detail or error)}') from error
+    return {'state': 'advisories' if findings else 'clear', 'vulnerabilities': findings,
+            'unchecked': unchecked, 'checked_at': now()}
 
 
 def is_running(app):
@@ -544,6 +637,8 @@ def entity(name, value, kind='version', **details):
 
 def snapshot(name):
     config = tomllib.loads(CONFIG.read_text())
+    if name == 'audit':
+        return {}  # Read-only advisory lookup. No installed artifacts to compare.
     if name == 'setup':
         return inventory()[0]
     if name == 'mise':
@@ -648,7 +743,7 @@ def native_preview(text, before):
     for match in re.finditer(r'(?m)^install cask ([^\s/]+)/([^\s]+)', text):
         package, version = match.groups()
         values = ', '.join(record['value'] for record in before.values() if record.get('value'))
-        plans.append({'name': label(package), 'kind': 'version', 'before': values or None, 'after': version})
+        plans.append({'name': label('brew-cask:' + package), 'kind': 'version', 'before': values or None, 'after': version})
     return plans
 
 
@@ -678,7 +773,7 @@ def preview_result(name, text, before):
     if name == 'shell-repositories':
         return {'notes': re.findall(r'(?mi)^(?:mise\s+)?(.*(?:would update|would fast-forward|would clone).*)$', text)}
     if name == 'brew' or name.startswith('brew-cask:'):
-        notes = re.findall(r'(?m)^.*(?:skipped:|WARN\s+)(.+)$', text)
+        notes = [note.strip() for note in re.findall(r'(?m)^.*(?:skipped:|WARN\s+)(.+)$', text)]
         plans = native_preview(text, before)
         # An unrecognized nonempty plan must not masquerade as "nothing available".
         known = ('already up to date', 'all formulae already poured', 'skipped:')
@@ -748,10 +843,10 @@ def background_changes(previous, before, errors):
 
 def cask_result(text, running):
     """Use native platform/version checks; do not guess cask metadata versions."""
-    if 'running and updates itself' in text:
-        return {'state': 'deferred-running-app', 'availability': 'confirmed'}
     if running and re.search(r'install cask [^/\s]+/[^\s]+', text):
         return {'state': 'deferred-running-app', 'availability': 'confirmed'}
+    if 'running and updates itself' in text:
+        return {'state': 'self-updating'}
     if 'skipped:' in text or 'WARN' in text:
         return {'state': 'availability-unknown', 'notes': ['Native check could not prove an eligible update; see the detailed log.']}
     if 'already up to date' in text or 'already installed' in text:
@@ -931,7 +1026,7 @@ def native_cask_update(key, check, log, command):
         command([MISE, 'bootstrap', 'packages', 'upgrade', key, '-y', '--dry-run'], log, timeout=120)
         log.flush(); log.seek(start); text = log.read(); log.seek(0, 2)
         result = cask_result(text, running)
-        if check:
+        if check and result['state'] in ('current', 'success'):
             result['state'] = 'checked'
         return result
     command([MISE, 'bootstrap', 'packages', 'apply', key, '-y'], log,
@@ -983,12 +1078,20 @@ def health():
 
 def show_health(console):
     report = health()
+    latest = load_report(STATE / 'last-run.json') or {}
+    audit = latest.get('results', {}).get('audit')
+    if audit:
+        report['latest_update_audit'] = audit
     if console.json_output:
         console.say(json.dumps(report, indent=2), force=True)
     else:
         console.say('Automatic update health: ' + report['state'])
         for name, result in report['checks'].items():
             console.say(f"  {'✓' if result['state'] == 'healthy' else '✗'} {name}: {result['detail']}")
+        if audit:
+            detail = (plural(len(audit['vulnerabilities']), 'advisory', 'advisories')
+                      if 'vulnerabilities' in audit else 'audit unavailable')
+            console.say(f'Last update security audit  {detail}' + (' · mise run maintenance:status' if audit['state'] != 'clear' else ''))
     return 0 if report['state'] == 'healthy' else 1
 
 
@@ -1001,7 +1104,10 @@ def show_history(console, limit):
     else:
         for report in reports:
             local = datetime.fromisoformat(report['started_at']).astimezone().strftime('%Y-%m-%d %H:%M')
-            console.say(f"{local}  {report['origin']:9} {report['state']:11} {len(report.get('changes', []))} changes · {len(report.get('since_previous_run', []))} between runs · {len(report.get('errors', []))} errors")
+            audit = report.get('results', {}).get('audit', {})
+            audit_status = (' · ' + plural(len(audit['vulnerabilities']), 'advisory', 'advisories')
+                            if 'vulnerabilities' in audit else ' · audit unavailable' if audit else '')
+            console.say(f"{local}  {report['origin']:9} {report['state']:11} {len(report.get('changes', []))} changes · {len(report.get('since_previous_run', []))} between runs · {len(report.get('errors', []))} errors{audit_status}")
     return 0
 
 def main(argv=None):
@@ -1042,12 +1148,12 @@ def main(argv=None):
         LOG.parent.mkdir(parents=True, exist_ok=True)
         rotate_logs()
         started = time.monotonic()
-        report = {'started_at': now(), 'check_only': args.check, 'results': {}, 'errors': [], 'log': str(LOG), 'schema_version': 3, 'origin': 'preview' if args.check else 'scheduled' if args.scheduled else 'manual'}
+        report = {'started_at': now(), 'check_only': args.check, 'results': {}, 'errors': [], 'log': str(LOG), 'schema_version': 4, 'origin': 'preview' if args.check else 'scheduled' if args.scheduled else 'manual'}
         previous = load_report(STATE / 'last-run.json')
         report['inventory_before'], report['inventory_errors_before'] = inventory()
         report['since_previous_run'] = background_changes(previous, report['inventory_before'], report['inventory_errors_before'])
-        console.say('Previewing maintenance updates' if args.check else 'Running maintenance updates')
-        console.say()
+        if console.verbose:
+            console.say('Previewing maintenance updates' if args.check else 'Running maintenance updates')
         with LOG.open('a+', buffering=1) as log:
             def step(name, action):
                 if report.get('interrupted'):
@@ -1085,6 +1191,9 @@ def main(argv=None):
                     result['before'], result['after'] = before, after
                     result['changes'] = compare(before, after) if before is not None and after is not None else []
                     # A failed install can still have changed a subset of artifacts.
+                    if name.startswith('brew-cask:') and result['state'] == 'deferred-running-app' and not result.get('plans'):
+                        log.seek(output_start)
+                        result['plans'] = native_preview(log.read(), before or {})
                     if args.check and not result.get('vendor_check') and result['state'] not in ('failed', 'interrupted'):
                         log.flush()
                         log.seek(output_start)
@@ -1124,6 +1233,7 @@ def main(argv=None):
                 step('setup', lambda: command([MISE, 'bootstrap', '--skip', skip, '--skip-dirty', '-y'], log))
                 step('mise', lambda: command([MISE, 'self-update', '-y', '--no-plugins'], log, timeout=600))
             step('tools', lambda: command([MISE, 'outdated', '--global', '--json'] if args.check else [MISE, 'upgrade', '--global', '-y'], log))
+            step('audit', lambda: audit_tools(log, console))
             if 'rust' in tomllib.loads(CONFIG.read_text()).get('tools', {}):
                 step('rustup', lambda: command([HOME / '.cargo/bin/rustup', 'check'] if args.check else [HOME / '.cargo/bin/rustup', 'self', 'update'], log, timeout=600))
 
