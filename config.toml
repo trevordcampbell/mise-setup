@@ -32,6 +32,7 @@ gh = "latest"
 uv = "latest"
 claude = "latest"
 codex = "latest"
+osv-scanner = "latest"
 
 [bootstrap.packages]
 # Deliberately installed tools; mise resolves their native library dependencies.
@@ -100,6 +101,13 @@ quiet = true
 description = "Preview global tool, package, and MarkText updates"
 dir = "~"
 run = '"$HOME/.local/bin/mise" -C "$HOME" exec -- python "$HOME/.config/mise/scripts/maintenance.py" --check'
+
+[tasks."maintenance:dependencies"]
+output = "interleave"
+quiet = true
+description = "Show dependency advisories and coverage from the last host update"
+dir = "~"
+run = '"$HOME/.local/bin/mise" -C "$HOME" exec -- python "$HOME/.config/mise/scripts/maintenance.py" --dependencies'
 
 [tasks."maintenance:status"]
 output = "interleave"

@@ -15,6 +15,8 @@ import tomllib
 import unittest
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
+
 spec = importlib.util.spec_from_file_location('maintenance', Path(__file__).resolve().parents[1] / 'scripts/maintenance.py')
 maintenance = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(maintenance)
@@ -549,10 +551,13 @@ class MaintenanceOutputTests(unittest.TestCase):
         self.audit = patch.object(maintenance, 'audit_tools', return_value={
             'state': 'clear', 'vulnerabilities': [], 'unchecked': [], 'checked_at': maintenance.now()})
         self.mock_audit = self.audit.start()
+        self.deps = patch.object(maintenance.dependency_audit, 'scan', return_value={'state': 'clear', 'owners': {}, 'match_count': 0})
+        self.mock_dependencies = self.deps.start()
         self.stdout = io.StringIO()
         self.stderr = io.StringIO()
 
     def tearDown(self):
+        self.deps.stop()
         self.audit.stop()
         self.vendor_patch.stop()
         self.inventory_patch.stop()
@@ -613,6 +618,27 @@ class MaintenanceOutputTests(unittest.TestCase):
         self.assertIn('CVE-example', self.stdout.getvalue())
         self.assertIn('Rust advisory coverage incomplete', self.stdout.getvalue())
         self.assertEqual(maintenance.load_report(self.state / 'last-run.json')['errors'], ['audit'])
+
+    def test_dependency_audit_runs_for_manual_scheduled_and_preview_and_survives_in_status(self):
+        for args in [[], ['--scheduled'], ['--check']]:
+            self.stdout.seek(0)
+            self.stdout.truncate()
+            self.assertEqual(self.invoke(args + ['--json']), 0)
+            self.assertEqual(json.loads(self.stdout.getvalue())['results']['dependency-audit']['match_count'], 0)
+        self.assertEqual(self.mock_dependencies.call_count, 3)
+        self.stdout.seek(0)
+        self.stdout.truncate()
+        with redirect_stdout(self.stdout):
+            self.assertEqual(maintenance.main(['--dependencies', '--json']), 0)
+        self.assertEqual(json.loads(self.stdout.getvalue())['state'], 'clear')
+
+    def test_dependency_scanner_failure_is_distinct_from_the_tool_version_audit(self):
+        self.mock_dependencies.side_effect = RuntimeError('OSV-Scanner offline')
+        self.assertEqual(self.invoke(['--json']), 1)
+        report = json.loads(self.stdout.getvalue())
+        self.assertEqual(report['errors'], ['dependency-audit'])
+        self.assertEqual(report['results']['audit']['state'], 'clear')
+        self.assertIn('marktext', report['results'])
 
     def test_unavailable_audit_is_an_error_and_later_checks_continue(self):
         self.mock_audit.side_effect = RuntimeError('Audit unavailable. OSV offline')

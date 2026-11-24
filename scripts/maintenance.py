@@ -26,6 +26,11 @@ import tomllib
 import xml.etree.ElementTree as ET
 from urllib.request import Request, urlopen
 
+if __package__:
+    from . import dependency_audit
+else:
+    import dependency_audit
+
 HOME = Path.home()
 CONFIG = HOME / '.config/mise/config.toml'
 MISE = HOME / '.local/bin/mise'
@@ -71,7 +76,7 @@ def label(name):
         'devutils': 'DevUtils', 'macs-fan-control': 'Macs Fan Control',
         'font-poppins': 'Poppins fonts', 'node': 'Node.js', 'python': 'Python',
         'gh': 'GitHub CLI', 'cargo:zpl_toolchain_cli': 'ZPL toolchain',
-        'brew-cask:claude': 'Claude Desktop', 'claude': 'Claude Code', 'audit': 'Security audit',
+        'brew-cask:claude': 'Claude Desktop', 'claude': 'Claude Code', 'audit': 'Security audit', 'dependency-audit': 'Tool dependencies', 'osv-scanner': 'OSV-Scanner',
         'github:skw398/scap': 'Scap', 'uv': 'uv', 'pnpm': 'pnpm',
     }
     short = name.removeprefix('brew-cask:').removeprefix('brew:')
@@ -107,6 +112,8 @@ def outcome(result):
     state = result['state']
     if state in ('failed', 'interrupted'):
         return '✗', result.get('error', 'Failed'), '31'
+    if 'match_count' in result:
+        return '·', plural(result['match_count'], 'dependency match', 'dependency matches'), '33' if result['match_count'] else '32'
     if state in ('clear', 'advisories'):
         count = len(result['vulnerabilities'])
         return ('!', plural(count, 'advisory', 'advisories'), '33') if count else ('✓', 'No known advisories for checked tools', '32')
@@ -292,6 +299,20 @@ class Console:
                               if not (item['tool'] == 'rust' and audit.get('rust_checks')))
         if unchecked:
             limits.append(f'No advisory source for {unchecked}.')
+        dependencies = results.get('dependency-audit', {})
+        affected, gaps, partial = [], {}, []
+        for owner in dependencies.get('owners', {}).values():
+            tool = label(owner['tool'])
+            if owner.get('findings'):
+                affected.append(f"{tool}: {plural(len(owner['findings']), 'match', 'matches')}")
+            if owner.get('coverage_note'):
+                gaps.setdefault(owner['coverage_note'], []).append(tool)
+            elif owner.get('coverage') == 'partial':
+                partial.append(tool)
+        for reason, names in gaps.items():
+            limits.append(f"{reason}: {', '.join(names)}.")
+        if partial:
+            limits.append('Partial dependency inventory: ' + ', '.join(partial) + '.')
         elapsed = report.get('elapsed_seconds')
         if elapsed is None and report.get('finished_at') and report.get('started_at'):
             elapsed = (datetime.fromisoformat(report['finished_at']) - datetime.fromisoformat(report['started_at'])).total_seconds()
@@ -301,7 +322,7 @@ class Console:
             title, color = title + ' interrupted', '31'
         elif failures or report['state'] == 'failed':
             title, color = title + ' finished with errors', '31'
-        elif security or limits or waiting:
+        elif security or affected or limits or waiting:
             title, color = title + ' complete', '36'
         else:
             title, color = title + ' complete', '32'
@@ -311,6 +332,8 @@ class Console:
             counts.append(plural(len(security), 'advisory', 'advisories'))
         elif not audit and report.get('schema_version', 0) >= 4:
             counts.append('audit did not run')
+        if 'match_count' in dependencies:
+            counts.append(plural(dependencies['match_count'], 'dependency match', 'dependency matches'))
         self.say(' · '.join(counts))
         if report.get('schema_version', 0) < 2:
             self.say('This older report did not record installed changes.')
@@ -322,6 +345,8 @@ class Console:
             self.say('No changes verified.' if incomplete else 'No changes this run.')
         self.section('Failed', failures, '31')
         self.section('Security advisories', security, '33')
+        if affected:
+            self.section('Dependencies to review', ['  ·  '.join(affected), 'Details: mise run maintenance:dependencies'], '33')
         self.section('Waiting', waiting, '33')
         self.section('Available to update', available, '1')
         heading = 'Observed during preview' if preview else 'Changed this run'
@@ -759,7 +784,7 @@ def entity(name, value, kind='version', **details):
 
 def snapshot(name):
     config = tomllib.loads(CONFIG.read_text())
-    if name == 'audit':
+    if name in ('audit', 'dependency-audit'):
         return {}  # Read-only advisory lookup. No installed artifacts to compare.
     if name == 'setup':
         return inventory()[0]
@@ -1257,6 +1282,9 @@ def show_health(console):
     audit = latest.get('results', {}).get('audit')
     if audit:
         report['latest_update_audit'] = audit
+    deps = latest.get('results', {}).get('dependency-audit', {})
+    if deps:
+        report['latest_dependency_audit'] = {k: deps[k] for k in ('state', 'match_count', 'error') if k in deps}
     if console.json_output:
         console.say(json.dumps(report, indent=2), force=True)
     else:
@@ -1267,7 +1295,36 @@ def show_health(console):
             detail = (plural(len(audit['vulnerabilities']), 'advisory', 'advisories')
                       if audit.get('state') in ('clear', 'advisories') else 'audit incomplete')
             console.say(f'Last update security audit  {detail}' + (' · mise run maintenance:status' if audit['state'] != 'clear' else ''))
+        if deps:
+            detail = 'scan incomplete' if deps['state'] == 'failed' else plural(deps['match_count'], 'match', 'matches')
+            console.say(f'Last dependency audit  {detail} · mise run maintenance:dependencies')
     return 0 if report['state'] == 'healthy' else 1
+
+
+def show_dependencies(console):
+    saved = load_report(STATE / 'last-run.json') or {}
+    report = saved.get('results', {}).get('dependency-audit') or {'state': 'not-run-yet'}
+    if console.json_output:
+        console.say(json.dumps(report, indent=2), force=True)
+        return
+    if report['state'] == 'not-run-yet':
+        console.say('Run mise run maintenance:update to record a dependency audit.')
+        return
+    console.say(f"Dependency audit  {saved['finished_at']}")
+    if report.get('error'):
+        console.section('Scan incomplete', [report['error']], '31')
+    for key, owner in report.get('owners', {}).items():
+        detail = owner.get('coverage_note') or f"{plural(owner['package_count'], 'package')} · {', '.join(owner['evidence'])}"
+        console.say(f"\n{key}  ·  {detail}")
+        for finding in owner['findings']:
+            fixed = ', '.join(finding['fixed_versions'])
+            title = f"{finding['package']} {finding['version']}  ·  {finding['id']}"
+            evidence = ', '.join(sorted({s['kind'] for s in finding['sources']}))
+            description = plain(finding['summary']) or finding['url']
+            console.say(textwrap.fill(title, width=84, initial_indent='  ', subsequent_indent='    '))
+            console.say(textwrap.fill(description + (f'  Listed fixes: {fixed}.' if fixed else ''),
+                                      width=84, initial_indent='    ', subsequent_indent='    '))
+            console.say(f"    {evidence} · {finding['url']}")
 
 
 def show_history(console, limit):
@@ -1282,6 +1339,10 @@ def show_history(console, limit):
             audit = report.get('results', {}).get('audit', {})
             audit_status = (' · ' + plural(len(audit['vulnerabilities']), 'advisory', 'advisories')
                             if audit.get('state') in ('clear', 'advisories') else ' · audit incomplete' if audit else '')
+            deps = report.get('results', {}).get('dependency-audit', {})
+            if deps:
+                audit_status += ' · ' + ('dependency scan incomplete' if deps['state'] == 'failed' else
+                                         plural(deps['match_count'], 'dependency match', 'dependency matches'))
             changes = plural(len(report.get('changes', [])), 'change')
             errors = plural(len(report.get('errors', [])), 'error')
             between = len(report.get('since_previous_run', []))
@@ -1295,6 +1356,7 @@ def main(argv=None):
     parser.add_argument('--verbose', action='store_true', help='Stream command output as well as saving the log')
     parser.add_argument('--json', action='store_true', dest='json_output', help='Print only the structured report on stdout')
     parser.add_argument('--scheduled', action='store_true', help='Tag this invocation as a launchd run')
+    parser.add_argument('--dependencies', action='store_true', help='Read dependency findings from the last update')
     parser.add_argument('--health', action='store_true', help='Verify doctor, services, and scheduled freshness')
     parser.add_argument('--history', action='store_true', help='Show bounded local report history')
     parser.add_argument('--limit', type=int, default=10, choices=range(1, 61), metavar='1..60')
@@ -1302,6 +1364,9 @@ def main(argv=None):
     args = parser.parse_args(argv)
     console = Console(verbose=args.verbose, json_output=args.json_output)
     command = partial(run, console=console)
+    if args.dependencies:
+        show_dependencies(console)
+        return 0
     if args.health:
         return show_health(console)
     if args.history:
@@ -1415,6 +1480,7 @@ def main(argv=None):
                 step('mise', lambda: command([MISE, 'self-update', '-y', '--no-plugins'], log, timeout=600))
             step('tools', lambda: command([MISE, 'outdated', '--global', '--json'] if args.check else [MISE, 'upgrade', '--global', '-y'], log))
             step('audit', lambda: audit_tools(log, console))
+            step('dependency-audit', lambda: dependency_audit.scan(MISE, HOME, ENV, log))
             if 'rust' in tomllib.loads(CONFIG.read_text()).get('tools', {}):
                 step('rustup', lambda: command([HOME / '.cargo/bin/rustup', 'check'] if args.check else [HOME / '.cargo/bin/rustup', 'self', 'update'], log, timeout=600))
 
