@@ -20,8 +20,8 @@ UV_PYTHON_PREFERENCE = "system"
 DISABLE_AUTOUPDATER = "1"
 
 [tools]
-node = "latest"
-python = "latest"
+node = { version = "latest", postinstall = 'sh "$HOME/.config/mise/scripts/update-bundled-manager.sh" node "$MISE_TOOL_INSTALL_PATH"' }
+python = { version = "latest", postinstall = 'sh "$HOME/.config/mise/scripts/update-bundled-manager.sh" python "$MISE_TOOL_INSTALL_PATH"' }
 bun = "latest"
 # Keep rustup's fallback correct when the previous global toolchain is pruned.
 rust = { version = "latest", postinstall = '"$HOME/.cargo/bin/rustup" default "${MISE_TOOL_INSTALL_PATH##*/}"' }

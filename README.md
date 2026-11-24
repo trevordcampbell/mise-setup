@@ -26,6 +26,8 @@ Mise must live at `~/.local/bin/mise`, because the update jobs use that stable p
 
 This manifest targets macOS ARM64, not a Linux server or Intel Mac. App logins, licenses, preferences, terminal font selection, documents, OrbStack containers, and application databases still need their own restore or sign-in. App Store applications, Zoom, RODE Central, licensed vendor applications, and macOS system applications are outside this manifest. No project configurations, APFS volumes, or Time Machine settings are changed.
 
+The postinstall hooks for Python 3.15.2 and Node 26.13.1 upgrade their original bundled pip 26.2.2 and npm 11.20.0 to pip 26.3 and npm 11.21.3 respectively. Each uses an age-eligible official distribution with a pinned digest and installs it in the owning Mise runtime. Other runtime versions and already-updated managers keep their distributor or installed versions. Virtual environments manage their own packages.
+
 ## Python and uv
 
 Mise manages the current Python interpreter and `uv@latest`; both join automatic tool updates. Pyenv is not installed. `UV_PYTHON_PREFERENCE=system` makes uv prefer Python already supplied by Mise. A project that explicitly requires another Python version can still ask uv to download it when needed.
