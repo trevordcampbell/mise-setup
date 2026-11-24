@@ -103,11 +103,22 @@ dir = "~"
 run = '"$HOME/.local/bin/mise" -C "$HOME" exec -- python "$HOME/.config/mise/scripts/maintenance.py" --check'
 
 [tasks."maintenance:dependencies"]
-output = "interleave"
+raw = true
 quiet = true
-description = "Show dependency advisories and coverage from the last host update"
+description = "Review dependency advisories from the latest host update"
 dir = "~"
-run = '"$HOME/.local/bin/mise" -C "$HOME" exec -- python "$HOME/.config/mise/scripts/maintenance.py" --dependencies'
+usage = '''
+flag "--tool <name>" help="Inspect one tool by Mise ID, display name, or unique prefix"
+flag "--verbose" help="Include individual advisories, evidence paths, and links"
+flag "--json" help="Print the saved report or selected tool as JSON"
+'''
+run = '''
+set --
+if [ -n "${usage_tool+x}" ]; then set -- "$@" "--tool=$usage_tool"; fi
+if [ "${usage_verbose:-false}" = true ]; then set -- "$@" --verbose; fi
+if [ "${usage_json:-false}" = true ]; then set -- "$@" --json; fi
+exec "$HOME/.local/bin/mise" -C "$HOME" exec -- python "$HOME/.config/mise/scripts/maintenance.py" --dependencies "$@"
+'''
 
 [tasks."maintenance:status"]
 output = "interleave"

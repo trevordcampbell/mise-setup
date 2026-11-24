@@ -749,6 +749,100 @@ class MaintenanceOutputTests(unittest.TestCase):
         self.assertNotIn('\033[', terminal.getvalue())
 
 
+class DependencyReportTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.state = Path(temp.name)
+        state = patch.object(maintenance, 'STATE', self.state)
+        state.start()
+        self.addCleanup(state.stop)
+        def owner(tool, findings=(), coverage='inventory found', note=None):
+            row = {'tool': tool, 'version': '1.0', 'package_count': int(coverage != 'no inventory'),
+                   'findings': list(findings), 'coverage': coverage, 'evidence': ['installed files']}
+            if note:
+                row['coverage_note'] = note
+            return row
+        def finding(name, score, fixes):
+            return {'id': f'OSV-{name}', 'package': name, 'version': '1', 'summary': f'Details of {name}',
+                    'severity': score, 'ecosystem': 'npm', 'fixed_versions': fixes,
+                    'url': 'https://osv.dev/' + name, 'sources': [{'kind': 'published lockfile', 'path': 'Cargo.lock'}]}
+        self.owners = {'python@1.0': owner('python', [finding('beta', '', []), finding('alpha', '8.9', ['2'])]),
+                       'pnpm@1.0': owner('pnpm', [finding('gamma', '5.0', [])], 'partial'),
+                       'uv@1.0': owner('uv'), 'bun@1.0': owner('bun', coverage='no inventory', note='No identifiable dependency inventory')}
+        self.report = {'state': 'advisories', 'owners': self.owners, 'match_count': 3}
+        self.saved = {'finished_at': '2026-11-24T21:00:00+00:00', 'results': {'dependency-audit': self.report}}
+
+    def render(self, *args, columns=80):
+        (self.state / 'last-run.json').write_text(json.dumps(self.saved))
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err), patch.dict(os.environ, {'COLUMNS': str(columns)}):
+            code = maintenance.main(['--dependencies', *args])
+        return code, out.getvalue(), err.getvalue()
+
+    def test_overview_ranks_matches_without_dumping_findings(self):
+        code, text, err = self.render()
+        self.assertEqual((code, err), (0, ''))
+        self.assertIn('3 advisory matches across 2 tools', text)
+        self.assertIn('3 of 4 tools · 1 match unscored', text)
+        self.assertLess(text.index('High 8.9'), text.index('Medium 5.0'))
+        self.assertRegex(text, r'High 8\.9\s+2\s+1\n')
+        self.assertIn('No inventory: Bun', text)
+        self.assertIn('Partial inventory: pnpm', text)
+        self.assertIn('No matches in checked packages: uv', text)
+        self.assertIn('mise run maintenance:dependencies --tool python', text)
+        self.assertNotIn('OSV-alpha', text)
+        self.assertNotIn('\x1b', text)
+        _, narrow, _ = self.render(columns=37)
+        self.assertIn('2 matches · 1 with fixes', narrow)
+        self.assertLess(max(map(len, narrow.splitlines())), 37)
+
+    def test_scoped_detail_verbose_and_json(self):
+        _, text, _ = self.render('--tool', 'PY')
+        self.assertLess(text.index('OSV-alpha'), text.index('OSV-beta'))
+        self.assertIn('Fix listed: 2', text)
+        self.assertIn('No dependency fix listed', text)
+        self.assertIn('lockfile only', text)
+        self.assertNotIn('OSV-gamma', text)
+        self.assertNotIn('https://', text)
+        _, full, _ = self.render('--verbose')
+        for value in ('OSV-alpha', 'OSV-beta', 'OSV-gamma', 'Cargo.lock', 'https://osv.dev/alpha'):
+            self.assertIn(value, full)
+        self.assertEqual(json.loads(self.render('--json')[1]), self.report)
+        self.assertEqual(json.loads(self.render('--tool', 'python@1.0', '--json')[1]), self.owners['python@1.0'])
+        for query, reason in [('p', 'Ambiguous tool'), ('missing', 'Unknown tool')]:
+            code, out, err = self.render('--tool', query, '--json')
+            self.assertEqual((code, out), (2, ''))
+            self.assertIn(reason, err)
+
+    def test_coverage_and_failure_do_not_read_as_all_clear(self):
+        self.report.update(state='failed', error='Scanner timed out')
+        _, text, _ = self.render()
+        self.assertIn('Scan incomplete', text)
+        self.assertIn('Scanner timed out', text)
+        self.assertNotIn('No matches in checked packages', text)
+        self.saved['results']['dependency-audit'] = {'state': 'interrupted', 'error': 'Interrupted'}
+        self.assertIn('Scan incomplete', self.render()[1])
+        self.saved['results']['dependency-audit'] = {'state': 'limited', 'owners': {'bun@1.0': self.owners['bun@1.0']}}
+        self.assertIn('No package versions available to check', self.render()[1])
+        self.saved['results']['dependency-audit'] = {'state': 'clear', 'owners': {'uv@1.0': self.owners['uv@1.0']}}
+        self.assertIn('No advisory matches in the packages checked', self.render()[1])
+        self.saved['results'] = {}
+        self.assertIn('No recorded dependency scan', self.render()[1])
+
+    def test_compare_matches_ignores_owner_upgrades_and_handles_lost_coverage(self):
+        old = json.loads(json.dumps(self.saved))
+        self.owners['python@1.0']['version'] = '2.0'
+        compare = lambda: maintenance.compare_dependency_matches(old, self.saved)
+        self.assertEqual(compare(), {'added': 0, 'no_longer_reported': 0})
+        self.owners['python@1.0']['findings'][0]['id'] = 'OSV-new'
+        self.saved['dependency_match_changes'] = compare()
+        self.assertIn('1 newly reported · 1 no longer reported', self.render()[1])
+        self.owners['python@1.0']['coverage'] = 'partial'
+        self.assertIsNone(compare())
+        self.assertIsNone(maintenance.compare_dependency_matches({}, self.saved))
+
+
 class ChangeReportingTests(unittest.TestCase):
     def test_comparison_includes_installs_removals_and_commits_but_not_metadata(self):
         before = {'app': maintenance.entity('Postman', '1.0'),

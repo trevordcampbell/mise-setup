@@ -14,6 +14,7 @@ import plistlib
 import platform
 import re
 import selectors
+import shlex
 import shutil
 import signal
 import subprocess
@@ -181,6 +182,15 @@ class Console:
         if force or not self.json_output:
             print(text, file=self.stdout, flush=True)
 
+    @property
+    def columns(self):
+        return max(12, min(100, shutil.get_terminal_size((88, 24)).columns - 1))
+
+    def line(self, text, *, indent=0, color=None):
+        wrapped = textwrap.fill(plain(text), width=self.columns, initial_indent=' ' * indent,
+                                subsequent_indent=' ' * indent, break_on_hyphens=False)
+        self.say(self.paint(wrapped, color) if color else wrapped)
+
     def starting(self, name, check_only):
         self.stop_progress()
         self.detail = ''
@@ -300,19 +310,10 @@ class Console:
         if unchecked:
             limits.append(f'No advisory source for {unchecked}.')
         dependencies = results.get('dependency-audit', {})
-        affected, gaps, partial = [], {}, []
-        for owner in dependencies.get('owners', {}).values():
-            tool = label(owner['tool'])
-            if owner.get('findings'):
-                affected.append(f"{tool}: {plural(len(owner['findings']), 'match', 'matches')}")
-            if owner.get('coverage_note'):
-                gaps.setdefault(owner['coverage_note'], []).append(tool)
-            elif owner.get('coverage') == 'partial':
-                partial.append(tool)
-        for reason, names in gaps.items():
-            limits.append(f"{reason}: {', '.join(names)}.")
-        if partial:
-            limits.append('Partial dependency inventory: ' + ', '.join(partial) + '.')
+        owners = dependencies.get('owners', {}).values()
+        affected = [owner for owner in owners if owner.get('findings')]
+        coverage = dependency_coverage(owners)
+        limits.extend(f"{reason}: {', '.join(names)}." for reason, names in coverage.items())
         elapsed = report.get('elapsed_seconds')
         if elapsed is None and report.get('finished_at') and report.get('started_at'):
             elapsed = (datetime.fromisoformat(report['finished_at']) - datetime.fromisoformat(report['started_at'])).total_seconds()
@@ -346,7 +347,11 @@ class Console:
         self.section('Failed', failures, '31')
         self.section('Security advisories', security, '33')
         if affected:
-            self.section('Dependencies to review', ['  ·  '.join(affected), 'Details: mise run maintenance:dependencies'], '33')
+            overview = f"Advisories matched packages in {plural(len(affected), 'tool')}."
+            review = [overview, *dependency_trend(report)]
+            if not preview:
+                review.append('Review by tool: mise run maintenance:dependencies')
+            self.section('Dependency advisories', review, '33')
         self.section('Waiting', waiting, '33')
         self.section('Available to update', available, '1')
         heading = 'Observed during preview' if preview else 'Changed this run'
@@ -1296,35 +1301,214 @@ def show_health(console):
                       if audit.get('state') in ('clear', 'advisories') else 'audit incomplete')
             console.say(f'Last update security audit  {detail}' + (' · mise run maintenance:status' if audit['state'] != 'clear' else ''))
         if deps:
-            detail = 'scan incomplete' if deps['state'] == 'failed' else plural(deps['match_count'], 'match', 'matches')
+            detail = 'scan incomplete' if deps['state'] in ('failed', 'interrupted') else plural(deps['match_count'], 'match', 'matches')
             console.say(f'Last dependency audit  {detail} · mise run maintenance:dependencies')
     return 0 if report['state'] == 'healthy' else 1
 
 
-def show_dependencies(console):
+def dependency_coverage(owners):
+    reasons = {'No identifiable dependency inventory': 'No inventory',
+               'Linked outside the Mise install store': 'Outside the Mise install folder'}
+    groups = {}
+    for owner in owners:
+        note = owner.get('coverage_note')
+        reason = reasons.get(note, note)
+        if not reason and owner.get('coverage') == 'partial':
+            reason = 'Partial inventory'
+        if reason:
+            groups.setdefault(reason, []).append(label(owner['tool']))
+    return groups
+
+
+def compare_dependency_matches(previous, current):
+    def snapshot(run):
+        audit = run.get('results', {}).get('dependency-audit', {})
+        if audit.get('state') not in ('clear', 'limited', 'advisories'):
+            return None
+        scope, matches = [], set()
+        for owner in audit.get('owners', {}).values():
+            scope.append((owner['tool'], owner['coverage'], owner.get('coverage_note'), tuple(owner['evidence'])))
+            for f in owner['findings']:
+                matches.add((owner['tool'], f['ecosystem'], f['package'], f['version'], f['id']))
+        # With multiple active versions the match count includes each installation.
+        if len({s[0] for s in scope}) != len(scope):
+            return None
+        return sorted(scope), matches
+    old, new = snapshot(previous), snapshot(current)
+    if old is None or new is None or old[0] != new[0]:
+        return None
+    return {'added': len(new[1] - old[1]), 'no_longer_reported': len(old[1] - new[1])}
+
+
+def dependency_trend(saved):
+    changes = saved.get('dependency_match_changes')
+    if changes is None:
+        return []
+    added, gone = changes['added'], changes['no_longer_reported']
+    if added or gone:
+        return [f'Since the previous update: {added} newly reported · {gone} no longer reported.']
+    return ['Same matches as the previous update.']
+
+
+def advisory_score(finding):
+    try:
+        value = float(finding.get('severity'))
+    except (ValueError, TypeError):
+        return -1
+    return value if 0 <= value <= 10 else -1
+
+
+def severity_display(score):
+    if score < 0:
+        return 'Unscored', '2'
+    for minimum, name, color in ((9, 'Critical', '1;31'), (7, 'High', '1;33'), (4, 'Medium', '36'),
+                                 (0.1, 'Low', '0'), (0, 'None', '0')):
+        if score >= minimum:
+            return f'{name} {score:.1f}', color
+
+
+def affected_tools(owners):
+    rows = []
+    for owner in owners:
+        findings = owner['findings']
+        if findings:
+            rows.append((owner, max(map(advisory_score, findings)), len(findings),
+                         sum(bool(f.get('fixed_versions')) for f in findings)))
+    return sorted(rows, key=lambda row: (-row[1], -row[2], label(row[0]['tool']), row[0]['version']))
+
+
+def dependency_table(console, rows):
+    names = [plain(label(owner['tool'])) for owner, *_ in rows]
+    name_width = max(len('Tool'), *map(len, names))
+    version_width = max(len('Installed'), *(len(plain(row[0]['version'])) for row in rows))
+    score_width = max(len('Top score'), *(len(severity_display(score)[0]) for _, score, _, _ in rows))
+    header = f"  {'Tool':<{name_width}}  {'Installed':<{version_width}}  {'Top score':<{score_width}}  {'Matches':>7}  {'With a fix':>10}"
+    wide = len(header) <= console.columns
+    if wide:
+        console.say(console.paint(header, '1'))
+    for name, (owner, score, count, fixes) in zip(names, rows):
+        version = plain(owner['version'])
+        severity, color = severity_display(score)
+        if wide:
+            colored = console.paint(severity.ljust(score_width), color)
+            console.say(f'  {name:<{name_width}}  {version:<{version_width}}  {colored}  {count:>7}  {fixes:>10}')
+        else:
+            console.line(f'{name} {version} · {severity}', indent=2, color='1')
+            console.line(f"{plural(count, 'match', 'matches')} · {fixes} with fixes", indent=4)
+
+
+def dependency_detail(console, owner):
+    findings = owner['findings']
+    console.say()
+    console.line(f"{label(owner['tool'])} {owner['version']}", color='1')
+    if not owner['package_count']:
+        console.line(owner.get('coverage_note') or 'No package versions identified.')
+        return
+    info = f"{plural(owner['package_count'], 'package version')} checked"
+    if owner['coverage'] == 'partial':
+        info += ' · partial inventory'
+    console.line(info + ' · ' + plural(len(findings), 'advisory match', 'advisory matches'))
+    for f in sorted(findings, key=lambda f: (-advisory_score(f), f['package'], f['version'], f['id'])):
+        severity, _ = severity_display(advisory_score(f))
+        console.say()
+        console.line(f"{f['package']} {f['version']}  ·  {severity}", indent=2, color='1')
+        if f.get('summary'):
+            console.line(f['summary'].replace('`', ''), indent=4)
+        fixes = ', '.join(f.get('fixed_versions', []))
+        fix = f'Fix listed: {fixes}' if fixes else 'No dependency fix listed'
+        console.line(f"{f['id']}  ·  {fix}", indent=4)
+        if console.verbose:
+            for src in f.get('sources', []):
+                console.line(f"{src['kind']} · {src['path']}", indent=4, color='2')
+            console.line(f.get('url', ''), indent=4)
+        elif {s['kind'] for s in f.get('sources', [])} == {'published lockfile'}:
+            console.line('Evidence from the lockfile only', indent=4, color='2')
+
+
+def show_dependencies(console, tool=None):
     saved = load_report(STATE / 'last-run.json') or {}
     report = saved.get('results', {}).get('dependency-audit') or {'state': 'not-run-yet'}
+    owners = report.get('owners', {})
+    selected = None
+    if tool is not None and owners:
+        query = tool.strip().casefold()
+        names = {key: (key.casefold(), owner['tool'].casefold(), label(owner['tool']).casefold())
+                 for key, owner in owners.items()}
+        keys = [k for k, aliases in names.items() if query in aliases]
+        if not keys and query:
+            keys = [k for k, aliases in names.items() if any(s.startswith(query) for s in aliases)]
+        if len(keys) != 1:
+            reason = 'Ambiguous tool' if keys else 'Unknown tool'
+            print(f"{reason} {plain(tool)!r}. Choose from: {', '.join(map(plain, keys or names))}.", file=console.stderr)
+            return 2
+        selected = owners[keys[0]]
     if console.json_output:
-        console.say(json.dumps(report, indent=2), force=True)
-        return
+        console.say(json.dumps(selected if selected is not None else report, indent=2), force=True)
+        return 0
+    title = 'Dependency audit'
+    stamp = saved.get('finished_at')
+    date = datetime.fromisoformat(stamp).astimezone().strftime('%b %d, %Y at %I:%M %p %Z').replace(' 0', ' ') if stamp else ''
+    if date and len(title) + len(date) + 3 <= console.columns:
+        console.say(console.paint(title, '1') + '   ' + console.paint(date, '2'))
+    else:
+        console.line(title, color='1')
+        if date:
+            console.line(date, color='2')
     if report['state'] == 'not-run-yet':
-        console.say('Run mise run maintenance:update to record a dependency audit.')
-        return
-    console.say(f"Dependency audit  {saved['finished_at']}")
-    if report.get('error'):
-        console.section('Scan incomplete', [report['error']], '31')
-    for key, owner in report.get('owners', {}).items():
-        detail = owner.get('coverage_note') or f"{plural(owner['package_count'], 'package')} · {', '.join(owner['evidence'])}"
-        console.say(f"\n{key}  ·  {detail}")
-        for finding in owner['findings']:
-            fixed = ', '.join(finding['fixed_versions'])
-            title = f"{finding['package']} {finding['version']}  ·  {finding['id']}"
-            evidence = ', '.join(sorted({s['kind'] for s in finding['sources']}))
-            description = plain(finding['summary']) or finding['url']
-            console.say(textwrap.fill(title, width=84, initial_indent='  ', subsequent_indent='    '))
-            console.say(textwrap.fill(description + (f'  Listed fixes: {fixed}.' if fixed else ''),
-                                      width=84, initial_indent='    ', subsequent_indent='    '))
-            console.say(f"    {evidence} · {finding['url']}")
+        console.line('No recorded dependency scan. Run mise run maintenance:update.')
+        return 0
+    incomplete = report['state'] in ('failed', 'interrupted')
+    if incomplete:
+        console.section('Scan incomplete', [report.get('error') or 'The scan stopped early.',
+                        'Retry with mise run maintenance:update.'], '1;31')
+    if selected is not None:
+        dependency_detail(console, selected)
+        if selected['findings']:
+            console.say()
+            console.line('Dependency fixes arrive with a release of ' + label(selected['tool']) + '.')
+            if not console.verbose:
+                console.line('Add --verbose for evidence paths and advisory links.', color='2')
+        return 0
+    if not owners:
+        if not incomplete:
+            console.line('No active tools were recorded for this scan.')
+        return 0
+
+    rows = affected_tools(owners.values())
+    checked = sum(bool(o['package_count']) for o in owners.values())
+    findings = [f for o in owners.values() for f in o['findings']]
+    if rows:
+        console.line(f"{plural(len(findings), 'advisory match', 'advisory matches')} across {plural(len(rows), 'tool')}", color='1')
+    elif checked and not incomplete:
+        console.line('No advisory matches in the packages checked.', color='1;32')
+    elif not checked:
+        console.line('No package versions available to check.', color='33')
+    subtitle = f'Package inventory found for {checked} of {len(owners)} tools'
+    unscored = sum(advisory_score(f) < 0 for f in findings)
+    if unscored:
+        subtitle += f" · {plural(unscored, 'match', 'matches')} unscored"
+    console.line(subtitle)
+    for line in dependency_trend(saved):
+        console.line(line)
+    if rows:
+        console.say()
+        dependency_table(console, rows)
+        console.say()
+        name = rows[0][0]['tool']
+        if sum(o['tool'] == name for o in owners.values()) > 1:
+            name += '@' + rows[0][0]['version']
+        console.line(f"Inspect {label(rows[0][0]['tool'])}", color='1')
+        console.line('mise run maintenance:dependencies --tool ' + shlex.quote(name), indent=2, color='36')
+        console.line('Dependency fixes arrive with eligible tool updates.')
+    coverage = dependency_coverage(owners.values())
+    no_matches = [label(o['tool']) for o in owners.values() if o['package_count'] and not o['findings']]
+    if no_matches and not incomplete:
+        coverage = {'No matches in checked packages': no_matches, **coverage}
+    console.section('Coverage', [f"{reason}: {', '.join(names)}" for reason, names in coverage.items()], '1')
+    if console.verbose:
+        for owner, *_ in rows:
+            dependency_detail(console, owner)
+    return 0
 
 
 def show_history(console, limit):
@@ -1341,7 +1525,7 @@ def show_history(console, limit):
                             if audit.get('state') in ('clear', 'advisories') else ' · audit incomplete' if audit else '')
             deps = report.get('results', {}).get('dependency-audit', {})
             if deps:
-                audit_status += ' · ' + ('dependency scan incomplete' if deps['state'] == 'failed' else
+                audit_status += ' · ' + ('dependency scan incomplete' if deps['state'] in ('failed', 'interrupted') else
                                          plural(deps['match_count'], 'dependency match', 'dependency matches'))
             changes = plural(len(report.get('changes', [])), 'change')
             errors = plural(len(report.get('errors', [])), 'error')
@@ -1357,16 +1541,18 @@ def main(argv=None):
     parser.add_argument('--json', action='store_true', dest='json_output', help='Print only the structured report on stdout')
     parser.add_argument('--scheduled', action='store_true', help='Tag this invocation as a launchd run')
     parser.add_argument('--dependencies', action='store_true', help='Read dependency findings from the last update')
+    parser.add_argument('--tool', metavar='NAME', help='Show dependency findings for one tool')
     parser.add_argument('--health', action='store_true', help='Verify doctor, services, and scheduled freshness')
     parser.add_argument('--history', action='store_true', help='Show bounded local report history')
     parser.add_argument('--limit', type=int, default=10, choices=range(1, 61), metavar='1..60')
     parser.add_argument('--marktext', action='store_true', help='Resolve and apply MarkText for bootstrap')
     args = parser.parse_args(argv)
+    if args.tool is not None and not args.dependencies:
+        parser.error('--tool requires the dependency report')
     console = Console(verbose=args.verbose, json_output=args.json_output)
     command = partial(run, console=console)
     if args.dependencies:
-        show_dependencies(console)
-        return 0
+        return show_dependencies(console, args.tool)
     if args.health:
         return show_health(console)
     if args.history:
@@ -1516,6 +1702,9 @@ def main(argv=None):
                     old = previous_results.get(name, {})
                     result['deferred_since'] = old.get('deferred_since', report['started_at']) if old.get('state') == 'deferred-running-app' else report['started_at']
                     result['consecutive_deferrals'] = old.get('consecutive_deferrals', 0) + 1 if old.get('state') == 'deferred-running-app' else 1
+            changes = compare_dependency_matches(previous or {}, report)
+            if changes is not None:
+                report['dependency_match_changes'] = changes
             save_report(report, args.scheduled)
             console.summary(report)
             return 130 if report.get('interrupted') else 1 if report['errors'] else 0

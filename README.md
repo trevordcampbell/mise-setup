@@ -122,7 +122,16 @@ Maintenance also runs a separate dependency scan after the tool-version audit. I
 
 Google’s OSV-Scanner reads installed package metadata, binary inventories, lockfiles and software bills of materials. A Cargo receipt for a locked crates.io install also allows maintenance to verify the exact published crate archive’s SHA-256 and read its packaged `Cargo.lock`. That lock can include optional, build or platform-specific dependencies. For binaries that retain Cargo registry paths, maintenance can recover additional names and versions. Those paths give partial evidence. Embedded Rust inventories take precedence for the same binary. OSV receives package identities for advisory lookup. The scan uses static data with dependency resolution and call analysis disabled. [Supported OSV-Scanner artifacts](https://google.github.io/osv-scanner/supported-languages-and-lockfiles/)
 
-The default summary groups matches by the tool that ships the dependency. A match counts one advisory group for a package version in one owning tool, deduplicating multiple copies and aliases. A match identifies a version for review. Whether an affected code path is used depends on the tool and its build. Apply dependency fixes through an updated owning tool. `mise run maintenance:dependencies` shows advisory IDs, evidence types, links and fixed versions when listed. Add `--json` for the per-tool inventory and finding source paths. Preview results also include `results.dependency-audit`. Missing or partial inventories are reported under **Check coverage**. Scanner failures remain visible alongside independent checks.
+Run `mise run maintenance:dependencies` for the latest saved scan. The overview ranks tools by the highest published numeric advisory score and counts matches with a listed dependency fix. Unscored matches remain visible. The coverage section identifies tools with partial or missing inventories. The report uses your local time and adapts to terminal width. After two successful scans with comparable tool coverage, it also shows how many matches appeared or disappeared.
+
+```sh
+mise run maintenance:dependencies --tool python           # Findings for one installed tool
+mise run maintenance:dependencies --tool zpl --verbose    # Evidence paths and advisory links
+mise run maintenance:dependencies --verbose              # Every finding grouped by tool
+mise run maintenance:dependencies --json                 # Full saved inventory and findings
+```
+
+`--tool` accepts a Mise ID, display name or unique prefix. Add `--json` to export the selected tool’s record. A match counts one advisory group for a package version in one owning tool. Multiple copies and aliases count once. The advisory score describes the dependency. Exposure depends on how the tool uses it. Maintenance picks up fixes through eligible releases of the owning tool. Preview results include `results.dependency-audit`, and scanner failures appear alongside independent checks.
 
 Run `mise -C "$HOME" bootstrap status --missing` to see which declared resources differ from the machine. The exit status is nonzero when there is drift. Use `mise run maintenance:check` to preview available version updates.
 
