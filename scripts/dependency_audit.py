@@ -14,6 +14,11 @@ import tomllib
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
+if __package__:
+    from . import advisory_fixes, audit_reviews
+else:
+    import advisory_fixes, audit_reviews
+
 PUBLIC_REGISTRIES = {'registry+https://github.com/rust-lang/crates.io-index', 'sparse+https://index.crates.io/'}
 REGISTRY_SOURCE = re.compile(
     rb'registry[/\\]src[/\\](?:index\.crates\.io-[a-f0-9]+|github\.com-1ecc6299db9ec823)[/\\]'
@@ -170,11 +175,12 @@ def summarize_sources(rows, roots, staged, owners):
                     'aliases': group.get('aliases', ids), 'severity': group.get('max_severity', ''),
                     'summary': v.get('summary') or '', 'url': 'https://osv.dev/vulnerability/' + ids[0],
                     'sources': []})
-                fixes = {event['fixed'] for identifier in ids for aff in records[identifier].get('affected', [])
-                         if (aff.get('package') or {}).get('name') == identity[1]
-                         and aff['package'].get('ecosystem') == identity[0] for rng in aff.get('ranges', [])
-                         if rng.get('type') in ('SEMVER', 'ECOSYSTEM') for event in rng['events'] if 'fixed' in event}
-                detail['fixed_versions'] = sorted(fixes | set(detail.get('fixed_versions', [])))
+                advisories = [records[i] for i in ids]
+                listed, on_line = advisory_fixes.fixes_for(identity, advisories)
+                for field, values in [('fixed_versions', listed), ('line_fixes', on_line),
+                                      ('record_hashes', [audit_reviews.digest(record) for record in advisories]),
+                                      ('record_modified', [record.get('modified', '') for record in advisories])]:
+                    detail[field] = sorted(set(values) | set(detail.get(field, [])))
                 source = {'kind': evidence, 'path': location}
                 components = shipping_components(source, identity[1])
                 if components:
@@ -193,6 +199,30 @@ def summarize_sources(rows, roots, staged, owners):
                               else 'inventory found')
         if not record['package_count'] and not record.get('coverage_note'):
             record['coverage_note'] = 'No identifiable dependency inventory'
+
+
+def scanner_rows(scanner, scratch, paths, env, log, errors):
+    config = scratch / 'osv-scanner.toml'
+    config.write_text('')
+    output = scratch / 'report.json'
+    cmd = [scanner, 'scan', 'source', '--recursive', '--no-ignore', '--no-resolve', '--allow-no-lockfiles',
+           '--all-packages', '--no-call-analysis=rust', '--no-call-analysis=go', '--verbosity=warn',
+           '--x-no-default-plugins', '--x-plugins', 'artifact,lockfile,sbom,javascript/packagejson,python/wheelegg', '--config', config,
+           '--format=json', '--output-file', output, *paths]
+    result = subprocess.run(cmd, cwd=scratch, env=env, stdin=subprocess.DEVNULL, text=True,
+                            capture_output=True, timeout=180)
+    log.write(result.stderr + '\n')
+    if result.returncode not in (0, 1):
+        raise RuntimeError(f'OSV-Scanner exited {result.returncode}. {result.stderr.strip()[-500:]}')
+    if result.stderr.strip():
+        errors.append('OSV-Scanner reported diagnostics: ' + result.stderr.strip()[-500:])
+    rows = json.loads(output.read_text())['results']
+    if not isinstance(rows, list):
+        raise ValueError('OSV-Scanner returned an invalid source list')
+    has_findings = any(pkg.get('vulnerabilities') for row in rows for pkg in row['packages'])
+    if bool(result.returncode) != has_findings:
+        raise ValueError('OSV-Scanner exit status disagrees with its vulnerability report')
+    return rows
 
 
 def scan(mise, home, env, log):
@@ -239,32 +269,132 @@ def scan(mise, home, env, log):
 
         rows = []
         if roots:
-            config = scratch / 'osv-scanner.toml'
-            config.touch()
-            output = scratch / 'report.json'
             scanner = mise_output('which', 'osv-scanner')
-            cmd = [scanner, 'scan', 'source', '--recursive', '--no-ignore', '--no-resolve', '--allow-no-lockfiles',
-                   '--all-packages', '--no-call-analysis=rust', '--no-call-analysis=go', '--verbosity=warn',
-                   '--x-no-default-plugins', '--x-plugins', 'artifact,lockfile,sbom,javascript/packagejson,python/wheelegg', '--config', config,
-                   '--format=json', '--output-file', output, *dict.fromkeys(roots.values()), evidence_dir]
-            result = subprocess.run(cmd, cwd=scratch, env=env, stdin=subprocess.DEVNULL, text=True,
-                                    capture_output=True, timeout=180)
-            log.write(result.stderr + '\n')
-            if result.returncode not in (0, 1):
-                raise RuntimeError(f'OSV-Scanner exited {result.returncode}. {result.stderr.strip()[-500:]}')
-            if result.stderr.strip():
-                errors.append('OSV-Scanner reported diagnostics: ' + result.stderr.strip()[-500:])
-            rows = json.loads(output.read_text())['results']
-            if not isinstance(rows, list):
-                raise ValueError('OSV-Scanner returned an invalid source list')
-            has_findings = any(pkg.get('vulnerabilities') for row in rows for pkg in row['packages'])
-            if bool(result.returncode) != has_findings:
-                raise ValueError('OSV-Scanner exit status disagrees with its vulnerability report')
+            rows = scanner_rows(scanner, scratch, [*dict.fromkeys(roots.values()), evidence_dir], env, log, errors)
         summarize_sources(rows, roots, staged, owners)
+        affected = [key for key in roots if owners[key]['findings']]
+        if affected:
+            try:
+                outdated = json.loads(mise_output('outdated', '--global', '--json'))
+                if not isinstance(outdated, dict):
+                    raise ValueError('Invalid Mise outdated result')
+            except Exception as exc:
+                outdated = None
+                errors.append(f'Eligible tool versions unavailable: {exc}')
+            for pos, key in enumerate(affected):
+                owner = owners[key]
+                audit_reviews.sign_findings(owner, roots[key])
+                if outdated is None:
+                    owner['update'] = {'state': 'unknown'}
+                    continue
+                candidate = outdated.get(owner['tool'])
+                if candidate is None:
+                    owner['update'] = {'state': 'current'}
+                elif candidate.get('current') != owner['version'] or not candidate.get('latest'):
+                    owner['update'] = {'state': 'unknown'}
+                else:
+                    release = candidate['latest']
+                    owner['update'] = {'state': 'eligible', 'version': release}
+                    try:
+                        check_candidate(mise_output, mise, home, env, log, scanner, scratch / f'candidate-{pos}',
+                                        roots[key], owner, release)
+                    except Exception as exc:
+                        owner['update']['detail'] = f'Candidate dependencies unverified: {exc}'
     count = sum(len(row['findings']) for row in owners.values())
     limited = any(row['coverage'] != 'inventory found' for row in owners.values())
     state = 'advisories' if count else 'limited' if limited else 'clear'
     report = {'state': state, 'owners': owners, 'match_count': count}
     if errors:
         report.update(state='failed', error=' / '.join(errors))
+    audit_reviews.apply_local(report, home / '.local/state/mise/maintenance' / audit_reviews.REVIEW_FILE)
     return report
+
+
+def candidate_outcomes(owner, release, root, rows, staged=None):
+    """Require affirmative replacement evidence in every originally matched inventory."""
+    def normalized(path, version):
+        return re.sub(r'(?<![0-9.])' + re.escape(version) + r'(?![0-9.])', '{tool-version}', str(path))
+
+    packages = {}
+    matches = {}
+    for row in rows:
+        path = Path(row['source']['path'])
+        # Recovered binary paths and published locks can establish a continued
+        # match. Only corresponding installed inventories verify replacement.
+        location = None if path in (staged or {}) else normalized(path.relative_to(root), release)
+        for entry in row['packages']:
+            p = entry['package']
+            key = (p.get('ecosystem'), p.get('name'))
+            versions = packages.setdefault((location, *key), set())
+            versions.add(p.get('version', ''))
+            ids = matches.setdefault(key, set())
+            for group in entry.get('groups', []):
+                ids.update(group.get('aliases', []))
+                ids.update(group.get('ids', []))
+            for record in entry.get('vulnerabilities', []):
+                ids.update([record['id'], *record.get('aliases', [])])
+    for f in owner['findings']:
+        key = (f['ecosystem'], f['package'])
+        if matches.get(key, set()).intersection([f['id'], *f.get('aliases', [])]):
+            f['owner_fix'] = 'still-matches'
+            continue
+        evidence = set()
+        for source in f['sources']:
+            path = normalized(source['path'], owner['version'])
+            versions = packages.get((path, *key))
+            if source['kind'] != 'installed files' or not versions:
+                break
+            old = advisory_fixes.version_key(key[0], f['version'])
+            def passed_fix(version):
+                value = advisory_fixes.version_key(key[0], version)
+                line = advisory_fixes.release_line(key[0], version)
+                return old is not None and value is not None and value > old and any(
+                    advisory_fixes.release_line(key[0], fixed) == line
+                    and (end := advisory_fixes.version_key(key[0], fixed)) is not None and end <= value
+                    for fixed in f.get('fixed_versions', []))
+            if not all(passed_fix(v) for v in versions):
+                break
+            evidence.update(versions)
+        else:
+            if evidence:
+                f.update(owner_fix='verified', replacement_versions=sorted(evidence))
+
+
+def check_candidate(mise_output, mise, home, env, log, scanner, scratch, installed, owner, release):
+    if not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9.+_-]*', release):
+        raise ValueError('Unexpected version identity')
+    scratch.mkdir()
+    root = installed.parent / release
+    if not root.is_dir() or root.is_symlink():
+        # Only stage stock, prebuilt registry assets. A preview must not run user
+        # hooks, build a tool from source, or activate an alternate host runtime.
+        info = json.loads(mise_output('tool', owner['tool'], '--json'))
+        backend = info['backend']
+        opts = info.get('tool_options', {})
+        source = info.get('config_source') or {}
+        config_path = Path(source['path']) if source.get('path') else None
+        configured = tomllib.loads(config_path.read_text())['tools'].get(owner['tool']) if config_path else None
+        stock = isinstance(configured, str) or (isinstance(configured, dict) and set(configured) == {'version'})
+        if (not stock or not backend.startswith('aqua:') or any(v for v in opts.values())
+                or not re.fullmatch(r'aqua:[\w.-]+/[\w.-]+', backend)):
+            owner['update']['detail'] = 'Eligible release found. Its packaged dependencies have not been verified.'
+            return
+        root = scratch / 'release'
+        clean = {k: v for k, v in env.items() if not k.startswith(('MISE_', 'XDG_'))}
+        clean.update(HOME=str(scratch), MISE_DATA_DIR=str(scratch / 'mise-data'),
+                     MISE_STATE_DIR=str(scratch / 'state'), MISE_CONFIG_DIR=str(scratch / 'config'),
+                     MISE_SYSTEM_CONFIG_FILE=str(scratch / 'no-system.toml'), MISE_YES='1',
+                     MISE_SELF_UPDATE_AUTO='0', MISE_TOOL_UPDATE_GLOBAL_AUTO='0')
+        proc = subprocess.run([mise, '-C', scratch, 'install-into', f'{backend}@{release}', root],
+                              cwd=scratch, env=clean, text=True, capture_output=True, timeout=120)
+        if proc.returncode:
+            raise ValueError(f'Mise could not stage the release (exit {proc.returncode})')
+    issues = []
+    evidence_dir = scratch / 'inputs'
+    evidence_dir.mkdir()
+    staged, problems = stage_evidence(root, evidence_dir, Path(env.get('CARGO_HOME') or home / '.cargo'))
+    issues.extend(problems)
+    rows = scanner_rows(scanner, scratch, [root, evidence_dir], env, log, issues)
+    if issues:
+        raise ValueError(issues[0])
+    candidate_outcomes(owner, release, root, rows, staged)

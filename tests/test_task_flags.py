@@ -22,7 +22,7 @@ class TaskFlagsTests(unittest.TestCase):
             'maintenance:status': (['--status'], ['--verbose', '--json']),
             'maintenance:health': (['--health'], ['--json']),
             'maintenance:history': (['--history'], ['--json', '--limit=2']),
-            'maintenance:dependencies': (['--dependencies'], ['--verbose', '--json', '--tool=Example Tool']),
+            'maintenance:dependencies': (['--dependencies'], ['--verbose', '--json', '--tool=Example Tool', '--review=abcde1234567', '--assessment=outside', '--reason=Reviewed build']),
         }
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)

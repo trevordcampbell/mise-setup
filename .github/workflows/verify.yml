@@ -19,7 +19,7 @@ jobs:
           - os: macos-latest
             python: '3.15'
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -49,6 +49,11 @@ jobs:
         run: |
           python scripts/check-config.py
           mise tasks validate --errors-only
+      - name: Exercise the macOS restore plan and bundled-manager hooks
+        if: runner.os == 'macOS'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python tests/restore_smoke.py
       - name: Check shell syntax
         shell: bash
         run: |

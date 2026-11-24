@@ -28,9 +28,9 @@ import xml.etree.ElementTree as ET
 from urllib.request import Request, urlopen
 
 if __package__:
-    from . import dependency_audit
+    from . import dependency_audit, audit_reviews
 else:
-    import dependency_audit
+    import dependency_audit, audit_reviews
 
 HOME = Path.home()
 CONFIG = HOME / '.config/mise/config.toml'
@@ -348,7 +348,7 @@ class Console:
         self.section('Security advisories', security, '33')
         if affected:
             overview = f"Advisories matched packages in {plural(len(affected), 'tool')}."
-            review = [overview, *dependency_trend(report)]
+            review = (review_overview(dependencies) if 'review_counts' in dependencies else [overview]) + dependency_trend(report)
             if not preview:
                 review.append('Review by tool: mise run maintenance:dependencies')
             self.section('Dependency advisories', review, '33')
@@ -1337,7 +1337,12 @@ def compare_dependency_matches(previous, current):
     old, new = snapshot(previous), snapshot(current)
     if old is None or new is None or old[0] != new[0]:
         return None
-    return {'added': len(new[1] - old[1]), 'no_longer_reported': len(old[1] - new[1])}
+    added = new[1] - old[1]
+    for owner in current['results']['dependency-audit']['owners'].values():
+        for f in owner['findings']:
+            if 'review_token' in f:
+                f['new_since_previous'] = (owner['tool'], f['ecosystem'], f['package'], f['version'], f['id']) in added
+    return {'added': len(added), 'no_longer_reported': len(old[1] - new[1])}
 
 
 def dependency_trend(saved):
@@ -1413,6 +1418,71 @@ def dependency_table(console, rows):
             console.line(f"{plural(count, 'match', 'matches')} · {fixes} with fixes", indent=4)
 
 
+def review_overview(report):
+    counts = report['review_counts']
+    owners = report['owners'].values()
+    lines = []
+    if report.get('review_error'):
+        lines.append('Local assessments could not be read: ' + report['review_error'])
+    verified = [f"{label(o['tool'])} {o['update']['version']}" for o in owners
+                if any(f.get('owner_fix') == 'verified' for f in o['findings'])]
+    if verified:
+        lines.append('Verified update available: ' + ', '.join(verified) + '. Run mise run maintenance:update.')
+    def priority(f):
+        assessment = f['review']['assessment']
+        return 'new' if assessment == 'unreviewed' and f.get('new_since_previous') else assessment
+
+    for status, heading in [('changed', 'Reopened after changes'), ('new', 'New since the previous update'),
+                            ('unreviewed', 'Awaiting review'), ('relevant', 'Relevant to this Mac')]:
+        groups = []
+        for owner in owners:
+            findings = [f for f in owner['findings'] if priority(f) == status]
+            if findings:
+                names = sorted({f['package'].split('/')[-1] for f in findings})
+                if status == 'relevant' or len(findings) <= 3:
+                    detail = ', '.join(names)
+                else:
+                    detail = f'{len(findings)} matches'
+                groups.append((len(findings), label(owner['tool']), detail))
+        if not groups:
+            continue
+        groups.sort(key=lambda row: (-row[0], row[1]))
+        total = sum(count for count, _, _ in groups)
+        lines.append(f"{heading} ({total}): " + ' · '.join(f'{name} ({detail})' for _, name, detail in groups) + '.')
+    other = [(counts.get(k, 0), wording) for k, wording in
+             [('unconfirmed', 'unconfirmed'), ('outside', 'outside scope'), ('notice', 'maintenance notices')]]
+    if any(c for c, _ in other):
+        lines.append('Previously reviewed: ' + ' · '.join(f'{c} {word}' for c, word in other if c) + '.')
+    eligible = [o for o in owners if o.get('update', {}).get('state') == 'eligible' and o['findings']]
+    for o in eligible:
+        findings = o['findings']
+        still = sum(f.get('owner_fix') == 'still-matches' for f in findings)
+        unknown = sum('owner_fix' not in f for f in findings)
+        states = [f'{n} {name}' for n, name in ((still, 'still match'), (unknown, 'unverified')) if n]
+        if states:
+            lines.append(f"{label(o['tool'])} {o['update']['version']} is eligible: " + ', '.join(states) + '.')
+    if any(o.get('update', {}).get('state') == 'unknown' for o in owners):
+        lines.append('Mise could not confirm update eligibility for some tools.')
+    elif not eligible and any(o.get('update', {}).get('state') == 'current' for o in owners):
+        lines.append('No eligible owning-tool update is available for these matches.')
+    return lines
+
+
+def owner_fix_text(owner, finding):
+    update = owner.get('update', {})
+    state = update.get('state')
+    if state == 'current':
+        return 'Waiting for an eligible release of ' + label(owner['tool']) + '.'
+    if state != 'eligible':
+        return 'Owning-tool update eligibility unverified.'
+    candidate = f"{label(owner['tool'])} {update['version']}"
+    if finding.get('owner_fix') == 'verified':
+        return f"Verified fix in {candidate} (ships {', '.join(finding['replacement_versions'])}). Run mise run maintenance:update."
+    if finding.get('owner_fix') == 'still-matches':
+        return f'{candidate} is eligible and still matches this advisory.'
+    return f'{candidate} is eligible. A fix in that release is unverified.'
+
+
 def dependency_detail(console, owner):
     findings = owner['findings']
     console.say()
@@ -1438,8 +1508,21 @@ def dependency_detail(console, owner):
         if f.get('summary'):
             console.line(f['summary'].replace('`', ''), indent=4)
         fixes = ', '.join(f.get('fixed_versions', []))
-        fix = f'Fix listed: {fixes}' if fixes else 'No dependency fix listed'
+        if 'line_fixes' in f:
+            line = ', '.join(f['line_fixes'])
+            fix = ('Dependency fix on this release line: ' + line if line else
+                   'No fix verified on this dependency release line' if fixes else 'No dependency fix listed')
+        else:
+            fix = f'Fix listed: {fixes} (release line unverified)' if fixes else 'No dependency fix listed'
         console.line(f"{f['id']}  ·  {fix}", indent=4)
+        if 'review' in f:
+            review = f['review']
+            assessment = review['assessment']
+            title = audit_reviews.ASSESSMENTS.get(assessment, 'Reopened' if assessment == 'changed' else 'Awaiting review')
+            console.line(title + (' · ' + review['reason'] if review.get('reason') else ''), indent=4)
+            console.line(owner_fix_text(owner, f), indent=4)
+            if console.verbose:
+                console.line('Review ID: ' + f['review_token'][:16], indent=4)
         if console.verbose:
             for src in f.get('sources', []):
                 console.line(f"{src['kind']} · {src['path']}", indent=4, color='2')
@@ -1448,9 +1531,35 @@ def dependency_detail(console, owner):
             console.line('Evidence from the lockfile only', indent=4, color='2')
 
 
+def latest_dependency_snapshot():
+    reports = (load_report(STATE / name) or {} for name in ('last-run.json', 'last-check.json'))
+    return max(reports, key=lambda r: r.get('finished_at', ''))
+
+
+def record_review(token, assessment, reason):
+    # Serialize read-modify-write with other reviewers and scans.
+    with (STATE / 'update.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        report = latest_dependency_snapshot().get('results', {}).get('dependency-audit', {})
+        if report.get('state') not in ('advisories', 'clear', 'limited'):
+            raise ValueError('A completed scan is required to record a review.')
+        matches = [f for o in report['owners'].values() for f in o['findings']
+                   if re.fullmatch(r'[0-9a-f]{12,64}', token) and f.get('review_token', '').startswith(token)]
+        if len(matches) != 1:
+            raise ValueError('This review ID does not uniquely match the latest scan. Check --verbose.')
+        f = matches[0]
+        path = STATE / audit_reviews.REVIEW_FILE
+        entries = audit_reviews.load(path)
+        entries[f['review_token']] = audit_reviews.entry(f, assessment, reason, now())
+        atomic_write(path, json.dumps({'version': 1, 'entries': entries}, indent=2) + '\n')
+    return f['id']
+
+
 def show_dependencies(console, tool=None):
-    saved = load_report(STATE / 'last-run.json') or {}
+    saved = latest_dependency_snapshot()
     report = saved.get('results', {}).get('dependency-audit') or {'state': 'not-run-yet'}
+    if 'review_counts' in report:
+        audit_reviews.apply_local(report, STATE / audit_reviews.REVIEW_FILE)
     owners = report.get('owners', {})
     selected = None
     if tool is not None and owners:
@@ -1513,7 +1622,15 @@ def show_dependencies(console, tool=None):
     console.line(subtitle)
     for line in dependency_trend(saved):
         console.line(line)
-    if rows:
+    if 'review_counts' in report:
+        direct = (saved.get('results', {}).get('audit') or {}).get('vulnerabilities', [])
+        if direct:
+            console.section('Installed tool advisories', [f"{label(f['tool'])} {f['version']} · {f['id']}"
+                            for f in direct], '33')
+        if rows:
+            console.section('What needs attention', review_overview(report), '1')
+            console.line('Use --tool NAME for findings or --verbose for all findings.', color='2')
+    elif rows:
         console.say()
         dependency_table(console, rows)
         console.say()
@@ -1569,7 +1686,19 @@ def main(argv=None):
     parser.add_argument('--history', action='store_true', help='Show bounded local report history')
     parser.add_argument('--limit', type=int, default=10, choices=range(1, 61), metavar='1..60')
     parser.add_argument('--marktext', action='store_true', help='Resolve and apply MarkText for bootstrap')
+    parser.add_argument('--review', metavar='ID')
+    parser.add_argument('--assessment', choices=audit_reviews.ASSESSMENTS)
+    parser.add_argument('--reason')
     args = parser.parse_args(argv)
+    if any(v is not None for v in (args.review, args.assessment, args.reason)):
+        if not (args.dependencies and args.review and args.assessment and args.reason) or args.tool:
+            parser.error('Use --review ID --assessment VALUE --reason TEXT with maintenance:dependencies')
+        try:
+            advisory = record_review(args.review, args.assessment, args.reason)
+        except (ValueError, OSError) as exc:
+            parser.error(str(exc))
+        print(json.dumps({'reviewed': advisory}) if args.json_output else f'Review saved for {advisory}.')
+        return 0
     if args.tool is not None and not args.dependencies:
         parser.error('--tool requires the dependency report')
     console = Console(verbose=args.verbose, json_output=args.json_output)
@@ -1587,8 +1716,11 @@ def main(argv=None):
         console.say(json.dumps(result, indent=2), force=True)
         return 0
     if args.status:
-        path = STATE / 'last-run.json'
-        console.summary(json.loads(path.read_text()) if path.exists() else {'state': 'not-run-yet'}, show_steps=True)
+        saved = load_report(STATE / 'last-run.json') or {'state': 'not-run-yet'}
+        deps = saved.get('results', {}).get('dependency-audit', {})
+        if 'review_counts' in deps:
+            audit_reviews.apply_local(deps, STATE / audit_reviews.REVIEW_FILE)
+        console.summary(saved, show_steps=True)
         return 0
     STATE.mkdir(parents=True, exist_ok=True)
     with (STATE / 'update.lock').open('a') as lock:
