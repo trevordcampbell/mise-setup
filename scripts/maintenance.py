@@ -8,6 +8,7 @@ from functools import partial
 import json
 import hashlib
 import os
+import operator
 from pathlib import Path
 import plistlib
 import platform
@@ -82,6 +83,8 @@ def format_change(change, *, planned=False):
     if name == '.oh-my-zsh':
         name = 'Oh My Zsh'
     old, new = change.get('before'), change.get('after')
+    if kind == 'availability' and planned:
+        return f'{name}: update available for {old}'
     if kind in ('font', 'content') and planned:
         return f'{name}: update available'
     if kind in ('font', 'content'):
@@ -282,9 +285,11 @@ class Console:
             advice = f'Fix listed in {fixes}. Check for an eligible update.' if fixes else 'No fixed version listed. Maintenance will recheck.'
             severity = f" · {finding['severity']}" if finding.get('severity') else ''
             description = finding['summary'].replace('`', '').rstrip('.')
-            security.append((f"{label(finding['tool'])} {finding['version']}  ·  {finding['id']}{severity}",
+            tool = 'Cargo crate' if finding.get('version_scheme') == 'crate' else label(finding['tool'])
+            security.append((f"{tool} {finding['version']}  ·  {finding['id']}{severity}",
                              f"{description}. {advice}"))
-        unchecked = ', '.join(label(item['tool']) for item in audit.get('unchecked', []))
+        unchecked = ', '.join(label(item['tool']) for item in audit.get('unchecked', [])
+                              if not (item['tool'] == 'rust' and audit.get('rust_checks')))
         if unchecked:
             limits.append(f'No advisory source for {unchecked}.')
         elapsed = report.get('elapsed_seconds')
@@ -461,6 +466,115 @@ def run(args, log, timeout=3600, console=None, env=None, progress=None):
         raise RuntimeError(f'Command exited {returncode}. {detail}')
 
 
+def rust_component(binary):
+    output = read_command([MISE, '-C', HOME, 'exec', '--', binary, '-Vv'])
+    version = re.search(r'^release: (\d+\.\d+\.\d+)$', output, re.M)
+    commit = re.search(r'^commit-hash: ([0-9a-f]{40})$', output, re.M)
+    if not version or not commit:
+        raise ValueError(f'Could not identify the stable {binary} release and build commit')
+    return {'version': version[1], 'commit': commit[1]}
+
+
+def cargo_crate_version(commit):
+    source = f'https://raw.githubusercontent.com/rust-lang/cargo/{commit}/Cargo.toml'
+    with urlopen(source, timeout=20) as response:
+        package = tomllib.load(response)['package']
+    if package['name'] != 'cargo' or not re.fullmatch(r'0\.\d+\.\d+', package['version']):
+        raise ValueError('Unrecognized Cargo crate version scheme at the installed commit')
+    return package['version']
+
+
+def affected_rust_version(requirement, component):
+    """GitHub repository advisories use comma-separated inclusive or exclusive bounds."""
+    operators = {'<': operator.lt, '<=': operator.le, '=': operator.eq, '>=': operator.ge, '>': operator.gt}
+    matches = []
+    versions = set()
+    for clause in requirement.split(','):
+        bound = re.fullmatch(r'\s*(<=|>=|<|>|=)?\s*(\d+\.\d+(?:\.\d+)?)\s*', clause)
+        if not bound:
+            raise ValueError(f'Unrecognized affected range {requirement!r}')
+        operation, limit = bound[1] or '=', numeric_version(bound[2])
+        if len(limit) == 2:
+            if operation not in ('<', '>='):
+                raise ValueError(f'Ambiguous partial version in {requirement!r}')
+            limit += (0,)
+        # Cargo advisories publish both 0.x crate and 1.x CLI release ranges.
+        version = component['crate_version'] if 'crate_version' in component and limit[0] == 0 else component['version']
+        versions.add(version)
+        matches.append(operators[operation](numeric_version(version), limit))
+    if len(versions) != 1:
+        raise ValueError(f'Mixed version schemes in {requirement!r}')
+    return all(matches), versions.pop()
+
+
+def rust_repository_audit(repo, evidence, findings):
+    source = f'https://api.github.com/repos/rust-lang/{repo}/security-advisories'
+    evidence.update(source=source, advisories_checked=0)
+    page, seen = 1, set()
+    while True:
+        records = json_url(f'{source}?state=published&per_page=100&page={page}')
+        if not isinstance(records, list):
+            raise ValueError('Expected a list of published advisories')
+        for record in records:
+            ghsa = record['ghsa_id']
+            url = f'https://github.com/rust-lang/{repo}/security/advisories/{ghsa}'
+            if ghsa in seen or record['html_url'] != url or record['state'] != 'published':
+                raise ValueError(f'Unexpected or repeated advisory {ghsa}')
+            seen.add(ghsa)
+            if record['withdrawn_at']:
+                continue
+            if not record['vulnerabilities']:
+                raise ValueError(f'{ghsa} has no affected version data')
+            for affected in record['vulnerabilities']:
+                package = (affected['package'].get('name') or '').lower()
+                expected = ('cargo',) if repo == 'cargo' else ('rust', 'rustc', 'std')
+                if package not in expected:
+                    raise ValueError(f'{ghsa} uses an unmapped component {package!r}')
+                requirement = affected['vulnerable_version_range']
+                applies, version = affected_rust_version(requirement, evidence)
+                if applies:
+                    identifier = record['cve_id'] or ghsa
+                    if not isinstance(record['summary'], str) or not record['summary']:
+                        raise ValueError(f'{ghsa} has no advisory summary')
+                    if not any(f['id'] == identifier and f.get('url') == url for f in findings):
+                        fixes = affected['patched_versions']
+                        if fixes is not None and not isinstance(fixes, str):
+                            raise ValueError(f'{ghsa} has malformed patched versions')
+                        findings.append({'tool': repo, 'version': version, 'component': package,
+                                         'version_scheme': 'crate' if version == evidence.get('crate_version') else 'release',
+                                         'id': identifier, 'aliases': [ghsa] if identifier != ghsa else [],
+                                         'severity': record['severity'], 'summary': record['summary'], 'url': url,
+                                         'affected_range': requirement, 'fixed': [fixes] if fixes else []})
+            evidence['advisories_checked'] += 1
+        if len(records) < 100:
+            break
+        page += 1
+
+
+def supplement_rust_audit(result, rust):
+    checks = {}
+    for repo, binary in [('rust', 'rustc'), ('cargo', 'cargo')]:
+        check = checks[repo] = {}
+        try:
+            check.update(rust_component(binary))
+            if repo == 'rust' and check['version'] != rust['version']:
+                raise ValueError(f"Active rustc {check['version']} differs from Mise's audited {rust['version']}")
+            if repo == 'cargo':
+                check['crate_version'] = cargo_crate_version(check['commit'])
+            rust_repository_audit(repo, check, result['vulnerabilities'])
+            check['state'] = 'checked'
+        except Exception as error:
+            # One unavailable source must preserve independent, confirmed findings.
+            check.update(state='unverified', error=str(error))
+    result['rust_checks'] = checks
+    errors = [f"{repo}: {c['error']}" for repo, c in checks.items() if c['state'] != 'checked']
+    if errors:
+        result.update(state='failed', error='Rust advisory coverage incomplete. ' + ' / '.join(errors))
+    else:
+        result['unchecked'].remove(rust)
+        result['state'] = 'advisories' if result['vulnerabilities'] else 'clear'
+
+
 def audit_tools(log, console):
     """Keep audit exit 1 with a valid finding distinct from an OSV or CLI failure."""
     cmd = [str(MISE), '-C', str(HOME), 'audit', '--json']
@@ -491,8 +605,16 @@ def audit_tools(log, console):
     except (ValueError, TypeError, KeyError) as error:
         detail = next((line for line in completed.stderr.splitlines() if 'ERROR' in line), completed.stderr.strip())
         raise RuntimeError(f'Audit unavailable (exit {completed.returncode}). {plain(detail or error)}') from error
-    return {'state': 'advisories' if findings else 'clear', 'vulnerabilities': findings,
-            'unchecked': unchecked, 'checked_at': now()}
+    result = {'state': 'advisories' if findings else 'clear', 'vulnerabilities': findings,
+              'unchecked': unchecked, 'checked_at': now()}
+    rust = next((row for row in unchecked if row['tool'] == 'rust'), None)
+    if rust:
+        supplement_rust_audit(result, rust)
+        detail = json.dumps(result['rust_checks'])
+        log.write(f'[{now()}] Rust repository advisory checks: {detail}\n')
+        if console.verbose:
+            print('Rust repository advisory checks: ' + detail, file=console.stderr, flush=True)
+    return result
 
 
 def is_running(app):
@@ -967,7 +1089,60 @@ def assess_vendor_release(key, release):
             'release': release, 'checked_at': now()}
 
 
+def orbstack_assessment(app):
+    info = plistlib.loads((app / 'Contents/Info.plist').read_bytes())
+    if info['CFBundleIdentifier'] != 'dev.kdrag0n.MacVirt':
+        raise ValueError('Unexpected OrbStack bundle identity')
+    version, build = info['CFBundleShortVersionString'], info['CFBundleVersion']
+    numeric_version(version)
+    numeric_version(build)
+    cli = app / 'Contents/MacOS/bin/orbctl'
+    result = subprocess.run([str(cli), 'update', '--check'], cwd=HOME, env=ENV, stdin=subprocess.DEVNULL,
+                            capture_output=True, text=True, timeout=45)
+    if result.returncode not in (0, 3):
+        raise RuntimeError(f'orbctl check exited {result.returncode}. {plain(result.stderr or result.stdout)}')
+    return {'state': 'current' if result.returncode == 0 else 'update-available',
+            'installed': f'{version} (build {build})', 'source': str(cli), 'command': ['update', '--check'],
+            'exit_code': result.returncode, 'message': plain(result.stdout), 'checked_at': now()}
+
+
+def orbstack_update(key, check, log, command):
+    app = APPLICATIONS / 'OrbStack.app'
+
+    def assess():
+        try:
+            result = orbstack_assessment(app)
+        except (OSError, ValueError, KeyError, plistlib.InvalidFileException, RuntimeError, subprocess.TimeoutExpired) as error:
+            result = {'state': 'unverified', 'error': f'OrbStack update check unavailable. {error}', 'checked_at': now()}
+        log.write(f'[{now()}] OrbStack update check: {json.dumps(result)}\n')
+        return result
+
+    if app.exists():
+        vendor = assess()
+        if vendor['state'] == 'update-available' and not check and not is_running(app):
+            native_cask_update(key, False, log, command)
+            vendor = assess()
+    else:
+        native = native_cask_update(key, check, log, command)
+        if check or not app.exists():
+            return native
+        vendor = assess()
+    if vendor['state'] == 'current':
+        return {'state': 'current', 'vendor_check': vendor}
+    if vendor['state'] == 'unverified':
+        return {'state': 'availability-unknown', 'vendor_check': vendor}
+    # orbctl documents availability via exit status and may omit the target version.
+    state = 'deferred-running-app' if not check and is_running(app) else 'update-available'
+    result = {'state': state, 'vendor_check': vendor, 'availability': 'confirmed', 'plans': [
+        {'name': 'OrbStack', 'kind': 'availability', 'before': vendor['installed'], 'after': None}]}
+    if not check and state == 'update-available':
+        result['notes'] = ['OrbStack still offers an update. Use its app updater or retry Mise later.']
+    return result
+
+
 def cask_update(key, check, log, command):
+    if key == 'brew-cask:orbstack':
+        return orbstack_update(key, check, log, command)
     release, vendor_error = None, None
     if key in VENDOR_APPS:
         try:
@@ -1090,7 +1265,7 @@ def show_health(console):
             console.say(f"  {'✓' if result['state'] == 'healthy' else '✗'} {name}: {result['detail']}")
         if audit:
             detail = (plural(len(audit['vulnerabilities']), 'advisory', 'advisories')
-                      if 'vulnerabilities' in audit else 'audit unavailable')
+                      if audit.get('state') in ('clear', 'advisories') else 'audit incomplete')
             console.say(f'Last update security audit  {detail}' + (' · mise run maintenance:status' if audit['state'] != 'clear' else ''))
     return 0 if report['state'] == 'healthy' else 1
 
@@ -1106,7 +1281,7 @@ def show_history(console, limit):
             local = datetime.fromisoformat(report['started_at']).astimezone().strftime('%Y-%m-%d %H:%M')
             audit = report.get('results', {}).get('audit', {})
             audit_status = (' · ' + plural(len(audit['vulnerabilities']), 'advisory', 'advisories')
-                            if 'vulnerabilities' in audit else ' · audit unavailable' if audit else '')
+                            if audit.get('state') in ('clear', 'advisories') else ' · audit incomplete' if audit else '')
             changes = plural(len(report.get('changes', [])), 'change')
             errors = plural(len(report.get('errors', [])), 'error')
             between = len(report.get('since_previous_run', []))
@@ -1178,6 +1353,9 @@ def main(argv=None):
                     output_start = log.tell()
                     try:
                         result = action() or {'state': 'checked' if args.check else 'success'}
+                        if result['state'] == 'failed':
+                            report['errors'].append(name)
+                            log.write(f"[{now()}] {name}: {result['error']}\n")
                     except KeyboardInterrupt:
                         result = {'state': 'interrupted', 'error': 'Interrupted by user'}
                         report['interrupted'] = True

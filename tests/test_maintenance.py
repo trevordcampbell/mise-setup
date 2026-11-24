@@ -370,10 +370,118 @@ class VendorReleaseTests(unittest.TestCase):
             fixture.tearDown()
 
 
+class OrbStackUpdateTests(unittest.TestCase):
+    key = 'brew-cask:orbstack'
+
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        root = Path(folder.name)
+        apps = patch.object(maintenance, 'APPLICATIONS', root)
+        apps.start()
+        self.addCleanup(apps.stop)
+        self.app = root / 'OrbStack.app'
+        (self.app / 'Contents').mkdir(parents=True)
+        self.info = self.app / 'Contents/Info.plist'
+        self.info.write_bytes(plistlib.dumps({'CFBundleIdentifier': 'dev.kdrag0n.MacVirt',
+                              'CFBundleShortVersionString': '2.2.5', 'CFBundleVersion': '21124'}))
+
+    def evaluate(self, codes, *, running=False, preview=False):
+        answers = [maintenance.subprocess.CompletedProcess([], n, 'vendor message', '') for n in codes]
+        with patch.object(maintenance.subprocess, 'run', side_effect=answers) as cli, \
+             patch.object(maintenance, 'is_running', return_value=running), \
+             patch.object(maintenance, 'native_cask_update') as native:
+            result = maintenance.cask_update(self.key, preview, io.StringIO(), None)
+        for call in cli.call_args_list:
+            self.assertEqual(call.args[0], [str(self.app / 'Contents/MacOS/bin/orbctl'), 'update', '--check'])
+        return result, native.call_count
+
+    def test_official_check_skips_replacement_and_does_not_execute_unknown_bundles(self):
+        result, applied = self.evaluate([0])
+        self.assertEqual(result['vendor_check']['installed'], '2.2.5 (build 21124)')
+        self.assertEqual((result['state'], applied), ('current', 0))
+        result, applied = self.evaluate([1])
+        self.assertEqual((result['state'], applied), ('availability-unknown', 0))
+        self.info.write_bytes(plistlib.dumps({'CFBundleIdentifier': 'other'}))
+        result, applied = self.evaluate([])
+        self.assertIn('identity', result['vendor_check']['error'])
+        self.assertEqual(applied, 0)
+
+    def test_preview_and_running_use_no_target_guess_and_idle_rechecks(self):
+        for opts, expected in [({'running': True}, 'deferred-running-app'), ({'preview': True}, 'update-available')]:
+            result, applied = self.evaluate([3], **opts)
+            self.assertEqual((result['state'], applied), (expected, 0))
+            self.assertIn('update available', maintenance.format_change(result['plans'][0], planned=True))
+        for final, expected in [(0, 'current'), (3, 'update-available'), (7, 'availability-unknown')]:
+            result, applied = self.evaluate([3, final])
+            self.assertEqual((result['state'], applied), (expected, 1))
+
+
+class RustAuditTests(unittest.TestCase):
+    @staticmethod
+    def advisory(repo, requirement, ident='GHSA-example', **extra):
+        record = {'ghsa_id': ident, 'cve_id': None, 'summary': 'Example', 'severity': 'low',
+                  'html_url': f'https://github.com/rust-lang/{repo}/security/advisories/{ident}',
+                  'state': 'published', 'withdrawn_at': None, 'vulnerabilities': [
+                      {'package': {'name': 'std' if repo == 'rust' else 'cargo'},
+                       'vulnerable_version_range': requirement, 'patched_versions': None}]}
+        return dict(record, **extra)
+
+    def test_real_published_range_boundaries_and_cargo_numbering(self):
+        component = {'version': '1.71.0', 'crate_version': '0.72.0'}
+        for req, match, version in [('>= 1.60.0, < 1.72', True, '1.71.0'), ('<= 0.72.1', True, '0.72.0'),
+                                    ('< 0.72.0', False, '0.72.0'), ('>= 1.87.0, < 1.89.0', False, '1.71.0')]:
+            self.assertEqual(maintenance.affected_rust_version(req, component), (match, version))
+        for req in ['unknown', '<= 1.72', '>= 0.70.0, < 1.75.0']:
+            with self.assertRaises(ValueError):
+                maintenance.affected_rust_version(req, component)
+
+    def test_supplement_merges_findings_and_keeps_unrelated_coverage(self):
+        rust = {'tool': 'rust', 'version': '1.88.0'}
+        result = {'vulnerabilities': [AuditTests.finding], 'unchecked': [rust, {'tool': 'zig'}]}
+        def source(url):
+            if '/rust/security' in url:
+                return [self.advisory('rust', '>= 1.87.0, < 1.89.0')]
+            return [self.advisory('cargo', '< 0.97.0', 'GHSA-cargo'),
+                    self.advisory('cargo', '< 0.99.0', 'GHSA-withdrawn', withdrawn_at='2025-01-01')]
+        with patch.object(maintenance, 'rust_component', side_effect=lambda name: {'version': '1.88.0', 'commit': 'a'*40}), \
+             patch.object(maintenance, 'cargo_crate_version', return_value='0.89.0'), \
+             patch.object(maintenance, 'json_url', side_effect=source):
+            maintenance.supplement_rust_audit(result, rust)
+        self.assertEqual(result['state'], 'advisories')
+        self.assertEqual([f['tool'] for f in result['vulnerabilities']], ['python', 'rust', 'cargo'])
+        self.assertEqual(result['vulnerabilities'][-1]['version_scheme'], 'crate')
+        self.assertEqual(result['unchecked'], [{'tool': 'zig'}])
+        self.assertEqual(result['rust_checks']['cargo']['advisories_checked'], 1)
+
+    def test_partial_source_failure_retains_other_findings(self):
+        rust = {'tool': 'rust', 'version': '1.71.0'}
+        result = {'vulnerabilities': [AuditTests.finding], 'unchecked': [rust]}
+        with patch.object(maintenance, 'rust_component', side_effect=lambda _: {'version': '1.71.0', 'commit': 'a'*40}), \
+             patch.object(maintenance, 'cargo_crate_version', side_effect=OSError('offline')), \
+             patch.object(maintenance, 'json_url', return_value=[self.advisory('rust', '< 1.89.0')]):
+            maintenance.supplement_rust_audit(result, rust)
+        self.assertEqual(result['state'], 'failed')
+        self.assertEqual(len(result['vulnerabilities']), 2)
+        self.assertIn('offline', result['error'])
+        self.assertEqual(result['unchecked'], [rust])
+
+    def test_pagination_and_unsupported_metadata(self):
+        first = [self.advisory('rust', '< 1.0.0', f'GHSA-{i}') for i in range(100)]
+        findings, record = [], {'version': '1.100.0'}
+        with patch.object(maintenance, 'json_url', side_effect=[first, [self.advisory('rust', '= 1.100.0')]]) as fetch:
+            maintenance.rust_repository_audit('rust', record, findings)
+        self.assertIn('page=2', fetch.call_args.args[0])
+        self.assertEqual(record['advisories_checked'], 101)
+        self.assertEqual(len(findings), 1)
+        with patch.object(maintenance, 'json_url', return_value=[self.advisory('rust', 'pending review')]), self.assertRaises(ValueError):
+            maintenance.rust_repository_audit('rust', record, [])
+
+
 class AuditTests(unittest.TestCase):
     finding = {'tool': 'python', 'version': '3.15.2', 'id': 'CVE-example', 'summary': 'Cookie policy',
                'severity': None, 'fixed': []}
-    unchecked = [{'tool': 'rust', 'version': '1.0'}]
+    unchecked = [{'tool': 'zig', 'version': '1.0'}]
 
     def audit(self, code, stdout, stderr=''):
         result = maintenance.subprocess.CompletedProcess([], code, stdout, stderr)
@@ -414,7 +522,7 @@ class AuditTests(unittest.TestCase):
                               'brew-cask:orbstack': {'state': 'availability-unknown', 'notes': [
                                   'installed app is current, newer, or incomparable']},
                               'audit': {'state': 'advisories', 'vulnerabilities': [dict(self.finding, fixed=['3.15.3'])],
-                                        'unchecked': self.unchecked}}}
+                                        'unchecked': [{'tool': 'rust', 'version': '1.0'}]}}}
         output = io.StringIO()
         with redirect_stdout(output):
             maintenance.Console().summary(report)
@@ -496,6 +604,15 @@ class MaintenanceOutputTests(unittest.TestCase):
                 self.assertEqual(report, maintenance.load_report(self.state / (filename + '.json')))
                 self.assertEqual(report['results']['audit']['vulnerabilities'], [finding])
                 self.assertEqual(report['errors'], [])
+
+    def test_partial_rust_audit_fails_run_without_losing_mise_findings(self):
+        self.mock_audit.return_value = {'state': 'failed', 'error': 'Rust advisory coverage incomplete',
+                                       'vulnerabilities': [AuditTests.finding], 'unchecked': [],
+                                       'rust_checks': {'cargo': {'state': 'unverified'}}}
+        self.assertEqual(self.invoke([]), 1)
+        self.assertIn('CVE-example', self.stdout.getvalue())
+        self.assertIn('Rust advisory coverage incomplete', self.stdout.getvalue())
+        self.assertEqual(maintenance.load_report(self.state / 'last-run.json')['errors'], ['audit'])
 
     def test_unavailable_audit_is_an_error_and_later_checks_continue(self):
         self.mock_audit.side_effect = RuntimeError('Audit unavailable. OSV offline')
