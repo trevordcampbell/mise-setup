@@ -15,6 +15,10 @@ for name, entry in config['dotfiles'].items():
 assert '--scheduled' in config['bootstrap']['macos']['launchd']['agents']['mise-maintenance']['args']
 assert 'macos-app:marktext' not in config['bootstrap']['packages'], 'MarkText must use the release resolver'
 assert config['vars']['marktext_artifact'] == 'MarkText.app'
-assert '--marktext' in ' '.join(config['bootstrap']['hooks']['final']), 'Fresh restore must resolve MarkText'
-assert 'install' in config['bootstrap']['hooks']['pre-packages'], 'Tools must precede fresh-machine font hooks'
+hooks = config['bootstrap']['hooks']
+assert '--marktext' in hooks['final'], 'Fresh restore must resolve MarkText'
+assert 'shell:completions' in hooks['final']
+assert 'github:credentials' in hooks['post-tools']
+assert 'fonts:sync' in hooks['pre-dotfiles']
+assert 'install' in hooks['pre-packages'], 'Tools must precede fresh-machine font hooks'
 print('Bootstrap sources, scheduled origin, and fresh MarkText resolver verified.')

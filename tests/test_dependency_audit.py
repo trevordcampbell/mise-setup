@@ -81,6 +81,21 @@ class DependencyAuditTests(unittest.TestCase):
             self.assertIn('Same installation', result['owners']['alias@1']['coverage_note'])
             self.assertIn('outside', result['owners']['linked@1']['coverage_note'])
 
+    def test_components_follow_evidence_for_arbitrary_bundles_and_scoped_packages(self):
+        cases = [
+            ('lib/dist-packages/sample/_vendor/bom.cdx.json', 'urllib3', ('sample',)),
+            ('lib/site-packages/foo_bar-1.2.dist-info/sboms/contents.cdx.json', 'pkg', ('foo_bar',)),
+            ('lib/node_modules/@org/app/node_modules/nested/node_modules/@team/pkg/package.json',
+             '@team/pkg', ('@org/app', 'nested')),
+            ('lib/node_modules/@team/pkg/package.json', '@team/pkg', ()),
+            ('bin/pnpm', 'helper', ()),
+        ]
+        for path, package, expected in cases:
+            with self.subTest(path=path):
+                src = {'kind': 'installed files', 'path': path}
+                self.assertEqual(audit.shipping_components(src, package), expected)
+                self.assertEqual(audit.shipping_components(dict(src, kind='published lockfile'), package), ())
+
     def test_aliases_multiple_copies_and_partial_evidence_do_not_inflate_findings(self):
         root = Path('/tools/example/1')
         pkg = {'package': {'name': 'helper', 'version': '1.0.0', 'ecosystem': 'crates.io'},

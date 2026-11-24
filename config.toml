@@ -89,18 +89,26 @@ stdout_path = "~/Library/Logs/mise-maintenance-agent.log"
 stderr_path = "~/Library/Logs/mise-maintenance-agent.err.log"
 
 [tasks."maintenance:update"]
-output = "interleave"
+raw = true
 quiet = true
 description = "Update global tools, host packages, idle apps, shell repositories, and mise"
 dir = "~"
-run = '"$HOME/.local/bin/mise" -C "$HOME" exec -- python "$HOME/.config/mise/scripts/maintenance.py"'
+usage = '''
+flag "--verbose" help="Show each stage and stream command output"
+flag "--json" help="Print the structured report on stdout"
+'''
+run = 'sh "$HOME/.config/mise/scripts/run-maintenance.sh"'
 
 [tasks."maintenance:check"]
-output = "interleave"
+raw = true
 quiet = true
 description = "Preview global tool, package, and MarkText updates"
 dir = "~"
-run = '"$HOME/.local/bin/mise" -C "$HOME" exec -- python "$HOME/.config/mise/scripts/maintenance.py" --check'
+usage = '''
+flag "--verbose" help="Show each stage and stream command output"
+flag "--json" help="Print the structured report on stdout"
+'''
+run = 'sh "$HOME/.config/mise/scripts/run-maintenance.sh" --check'
 
 [tasks."maintenance:dependencies"]
 raw = true
@@ -112,20 +120,18 @@ flag "--tool <name>" help="Inspect one tool by Mise ID, display name, or unique 
 flag "--verbose" help="Include individual advisories, evidence paths, and links"
 flag "--json" help="Print the saved report or selected tool as JSON"
 '''
-run = '''
-set --
-if [ -n "${usage_tool+x}" ]; then set -- "$@" "--tool=$usage_tool"; fi
-if [ "${usage_verbose:-false}" = true ]; then set -- "$@" --verbose; fi
-if [ "${usage_json:-false}" = true ]; then set -- "$@" --json; fi
-exec "$HOME/.local/bin/mise" -C "$HOME" exec -- python "$HOME/.config/mise/scripts/maintenance.py" --dependencies "$@"
-'''
+run = 'sh "$HOME/.config/mise/scripts/run-maintenance.sh" --dependencies'
 
 [tasks."maintenance:status"]
-output = "interleave"
+raw = true
 quiet = true
 description = "Show the last automatic or manual maintenance result"
 dir = "~"
-run = '"$HOME/.local/bin/mise" -C "$HOME" exec -- python "$HOME/.config/mise/scripts/maintenance.py" --status'
+usage = '''
+flag "--verbose" help="Show the recorded outcome of every stage"
+flag "--json" help="Print the structured report on stdout"
+'''
+run = 'sh "$HOME/.config/mise/scripts/run-maintenance.sh" --status'
 
 # Global shell checkouts; update only by fast-forward and preserve local edits.
 [bootstrap.repos]
@@ -177,7 +183,14 @@ fi
 [bootstrap.hooks]
 # Install tools before fonts and RunAtLoad update jobs on a fresh machine.
 pre-packages = '"$HOME/.local/bin/mise" -C "$HOME" install'
-final = ['"$HOME/.local/bin/mise" -C "$HOME" exec -- python "$HOME/.config/mise/scripts/maintenance.py" --marktext', '"$HOME/.local/bin/mise" -C "$HOME" run github:credentials', '"$HOME/.local/bin/mise" -C "$HOME" run shell:completions']
+post-tools = '"$HOME/.local/bin/mise" -C "$HOME" run github:credentials'
+# Maintenance performs these two actions after upgrading the tool binaries.
+final = '''
+if [ "${HOST_MAINTENANCE_POST_UPGRADE:-0}" != 1 ]; then
+  "$HOME/.local/bin/mise" -C "$HOME" exec -- python "$HOME/.config/mise/scripts/maintenance.py" --marktext
+  "$HOME/.local/bin/mise" -C "$HOME" run shell:completions
+fi
+'''
 pre-dotfiles = '"$HOME/.local/bin/mise" -C "$HOME" run fonts:sync'
 
 [tasks."fonts:sync"]
@@ -205,22 +218,33 @@ run = [
 ]
 
 [tasks."setup:sync"]
-output = "interleave"
+raw = true
 quiet = true
 description = "Pull saved setup and apply newly declared resources safely"
 dir = "~"
-run = '"$HOME/.local/bin/mise" -C "$HOME" exec -- python "$HOME/.config/mise/scripts/maintenance.py"'
+usage = '''
+flag "--verbose" help="Show each stage and stream command output"
+flag "--json" help="Print the structured report on stdout"
+'''
+run = 'sh "$HOME/.config/mise/scripts/run-maintenance.sh"'
 
 [tasks."maintenance:health"]
-output = "interleave"
+raw = true
 quiet = true
 description = "Verify automatic update services and scheduled freshness"
 dir = "~"
-run = '"$HOME/.local/bin/mise" -C "$HOME" exec -- python "$HOME/.config/mise/scripts/maintenance.py" --health'
+usage = '''
+flag "--json" help="Print the structured report on stdout"
+'''
+run = 'sh "$HOME/.config/mise/scripts/run-maintenance.sh" --health'
 
 [tasks."maintenance:history"]
-output = "interleave"
+raw = true
 quiet = true
 description = "Show recent maintenance runs and observed changes"
 dir = "~"
-run = '"$HOME/.local/bin/mise" -C "$HOME" exec -- python "$HOME/.config/mise/scripts/maintenance.py" --history'
+usage = '''
+flag "--limit <count>" help="Show 1 to 60 recent runs (default 10)"
+flag "--json" help="Print the structured report on stdout"
+'''
+run = 'sh "$HOME/.config/mise/scripts/run-maintenance.sh" --history'

@@ -797,6 +797,20 @@ class DependencyReportTests(unittest.TestCase):
         self.assertIn('2 matches · 1 with fixes', narrow)
         self.assertLess(max(map(len, narrow.splitlines())), 37)
 
+    def test_old_report_attributes_findings_without_changing_the_saved_json(self):
+        findings = self.owners['python@1.0']['findings']
+        source = {'kind': 'installed files', 'path': 'lib/site-packages/a_tool/_vendor/bom.cdx.json'}
+        for finding in findings:
+            finding['sources'] = [source]
+        self.assertIn('Python → a_tool', self.render()[1])
+        self.assertIn('Python → a_tool → alpha 1', self.render('--tool', 'python')[1])
+        self.assertEqual(json.loads(self.render('--json')[1]), self.report)
+        findings[1]['sources'].append({'kind': 'installed files', 'path': 'bin/standalone'})
+        self.assertNotIn('Python → a_tool', self.render()[1])
+        _, text, _ = self.render('--tool', 'python')
+        self.assertIn('Python → alpha', text)
+        self.assertIn('Python → a_tool → alpha', text)
+
     def test_scoped_detail_verbose_and_json(self):
         _, text, _ = self.render('--tool', 'PY')
         self.assertLess(text.index('OSV-alpha'), text.index('OSV-beta'))
@@ -945,6 +959,33 @@ class ChangeReportingTests(unittest.TestCase):
         finally: fixture.tearDown()
 
 
+    def test_setup_compares_readable_sections_when_others_fail_before_or_after(self):
+        fixture = MaintenanceOutputTests('test_json_stdout_is_exactly_the_saved_report')
+        fixture.setUp()
+        self.addCleanup(fixture.tearDown)
+        def values(**versions):
+            return {f'{section}/pkg': maintenance.entity(section, version, stage=section)
+                    for section, version in versions.items()}
+        old = values(tools='1', brew='1', marktext='1')
+        new = values(tools='2', rustup='1', marktext='1')
+        reads = [(old, {}), (old, {'rustup': 'temporarily unavailable'}),
+                 (new, {'brew': 'permission denied'}), (new, {})]
+        with patch.object(maintenance, 'inventory', side_effect=reads):
+            self.assertEqual(fixture.invoke(['--json']), 0)
+        report = json.loads(fixture.stdout.getvalue())
+        setup = report['results']['setup']
+        self.assertEqual([(c['id'], c['action']) for c in setup['changes']], [('tools/pkg', 'updated')])
+        self.assertEqual(setup['observation_errors'],
+                         ['before: Rustup: temporarily unavailable', 'after: Native packages: permission denied'])
+        self.assertEqual(report['changes'], [dict(setup['changes'][0], stage='setup')])
+        self.assertEqual(setup['before'], old)
+        self.assertEqual(setup['after'], new)
+        fixture.stdout.seek(0)
+        fixture.stdout.truncate()
+        with redirect_stdout(fixture.stdout):
+            maintenance.main(['--status'])
+        self.assertIn('change verification incomplete', fixture.stdout.getvalue())
+
     def test_unreadable_state_does_not_skip_updates_or_claim_no_changes(self):
         fixture = MaintenanceOutputTests('test_json_stdout_is_exactly_the_saved_report');fixture.setUp()
         def snapshot(name):
@@ -1040,6 +1081,29 @@ class SyncHealthHistoryTests(unittest.TestCase):
     def tearDown(self):
         self.fixture.tearDown()
 
+    def test_only_the_post_upgrade_actions_are_deferred_during_reconciliation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            fake = home / '.local/bin/mise'
+            fake.parent.mkdir(parents=True)
+            fake.write_text("#!/bin/sh\nprintf '%s\\n' \"$*\"\n")
+            fake.chmod(0o755)
+            hooks = tomllib.loads((Path(__file__).resolve().parents[1] / 'config.toml').read_text())['bootstrap']['hooks']
+            env = {'HOME': str(home), 'PATH': os.environ['PATH']}
+            def execute(cmd, env):
+                return maintenance.subprocess.check_output(['sh', '-ec', cmd], env=env, text=True)
+            fresh = execute(hooks['final'], env).splitlines()
+            self.assertEqual(len(fresh), 2)
+            self.assertIn('--marktext', fresh[0])
+            self.assertIn('shell:completions', fresh[1])
+            def command(args, log, **kwargs):
+                if '--skip' in args:
+                    env['HOST_MAINTENANCE_POST_UPGRADE'] = kwargs['env']['HOST_MAINTENANCE_POST_UPGRADE']
+                    self.assertEqual(execute(hooks['final'], env), '')
+                    self.assertIn('github:credentials', execute(hooks['post-tools'], env))
+            self.assertEqual(self.fixture.invoke([], command=command), 0)
+            self.assertEqual(env['HOST_MAINTENANCE_POST_UPGRADE'], '1')
+
     def test_pulled_declaration_is_applied_before_upgrade(self):
         calls = []
         def command(args, log, **kwargs):
@@ -1074,7 +1138,12 @@ class SyncHealthHistoryTests(unittest.TestCase):
         report = maintenance.load_report(maintenance.STATE / 'last-scheduled.json')
         self.assertEqual(report['origin'], 'scheduled')
         self.assertFalse((maintenance.STATE / 'last-manual.json').exists())
-        self.assertIn('packages,macos-launchd-agents', next(c for c in calls if '--skip' in c))
+        main_phase = next(c for c in calls if '--skip' in c)
+        self.assertEqual(set(main_phase[main_phase.index('--skip') + 1].split(',')),
+                         {'packages', 'dotfiles', 'macos-launchd-agents'})
+        self.assertEqual(sum('--only' in c and 'dotfiles' in c for c in calls), 1)
+        self.assertEqual(sum('shell:completions' in c for c in calls), 1)
+        self.assertFalse(any('--deploy' in c for c in calls))
 
     def test_health_detects_missing_stale_and_failed_services(self):
         with patch.object(maintenance, 'read_command', side_effect=RuntimeError('not loaded')):

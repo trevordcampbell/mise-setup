@@ -110,6 +110,30 @@ def stage_evidence(root, dest, cargo_home):
     return sources, errors
 
 
+def shipping_components(source, package):
+    """Identify package containers from standard installed layouts; paths do not prove runtime calls."""
+    if source.get('kind') != 'installed files':
+        return ()
+    parts = Path(source['path']).parts
+    chain = []
+    for i, part in enumerate(parts[:-1]):
+        if part == 'node_modules':
+            name = parts[i + 1]
+            if name.startswith('@') and i + 2 < len(parts):
+                name += '/' + parts[i + 2]
+            if re.fullmatch(r'(?:@[\w-][\w.-]*/)?[\w-][\w.-]*', name):
+                chain.append(name)
+        if part in ('site-packages', 'dist-packages'):
+            container = parts[i + 1]
+            if i + 2 < len(parts) and parts[i + 2] in ('_vendor', 'vendor', 'vendored'):
+                chain.append(container)
+            elif container.endswith('.dist-info') and i + 2 < len(parts) and parts[i + 2] == 'sboms':
+                chain.append(container.removesuffix('.dist-info').split('-', 1)[0])
+    if chain and chain[-1].casefold() == package.casefold():
+        chain.pop()
+    return tuple(chain)
+
+
 def summarize_sources(rows, roots, staged, owners):
     inventories = {owner: set() for owner in owners}
     matches = {owner: {} for owner in owners}
@@ -152,6 +176,9 @@ def summarize_sources(rows, roots, staged, owners):
                          if rng.get('type') in ('SEMVER', 'ECOSYSTEM') for event in rng['events'] if 'fixed' in event}
                 detail['fixed_versions'] = sorted(fixes | set(detail.get('fixed_versions', [])))
                 source = {'kind': evidence, 'path': location}
+                components = shipping_components(source, identity[1])
+                if components:
+                    source['components'] = list(components)
                 if source not in detail['sources']:
                     detail['sources'].append(source)
     for owner, record in owners.items():

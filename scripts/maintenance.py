@@ -69,7 +69,7 @@ def label(name):
     labels = {
         'mise': 'Mise', 'tools': 'Global tools', 'rustup': 'Rustup',
         'shell-repositories': 'Configuration and shell repositories',
-        'shell-completions': 'Shell completions', 'variable-fonts': 'Variable fonts',
+        'shell-completions': 'Shell completions', 'variable-fonts': 'Variable fonts and dotfiles',
         'marktext': 'MarkText', 'brew': 'Native packages', 'setup': 'Declared setup',
         'visual-studio-code': 'Visual Studio Code', 'google-chrome': 'Google Chrome',
         'github': 'GitHub Desktop', 'iterm2': 'iTerm2', 'orbstack': 'OrbStack',
@@ -791,8 +791,6 @@ def snapshot(name):
     config = tomllib.loads(CONFIG.read_text())
     if name in ('audit', 'dependency-audit'):
         return {}  # Read-only advisory lookup. No installed artifacts to compare.
-    if name == 'setup':
-        return inventory()[0]
     if name == 'mise':
         return {'mise': entity('Mise', read_command([MISE, '--version']).split()[0])}
     if name == 'rustup':
@@ -870,10 +868,12 @@ def app_snapshot(app, name):
     return {str(app): entity(name, value)}
 
 
-def compare(before, after):
+def compare(before, after, *, unverified_stages=()):
     changes = []
     for key in sorted(before.keys() | after.keys()):
         old, new = before.get(key), after.get(key)
+        if (new or old).get('stage') in unverified_stages:
+            continue
         old_value, new_value = old.get('value') if old else None, new.get('value') if new else None
         if old_value == new_value:
             continue
@@ -1377,12 +1377,28 @@ def affected_tools(owners):
     return sorted(rows, key=lambda row: (-row[1], -row[2], label(row[0]['tool']), row[0]['version']))
 
 
+def component_routes(finding):
+    # Older saved reports retain the same evidence paths even without the components field.
+    return {tuple(src['components']) if 'components' in src else
+            dependency_audit.shipping_components(src, finding['package']) for src in finding['sources']}
+
+
+def dependency_tool_label(owner, *, with_version=False):
+    routes = {route for f in owner['findings'] for route in (component_routes(f) or {()})}
+    name = label(owner['tool'])
+    if with_version:
+        name += ' ' + owner['version']
+    if len(routes) == 1:
+        return ' → '.join((name, *next(iter(routes))))
+    return name
+
+
 def dependency_table(console, rows):
-    names = [plain(label(owner['tool'])) for owner, *_ in rows]
-    name_width = max(len('Tool'), *map(len, names))
-    version_width = max(len('Installed'), *(len(plain(row[0]['version'])) for row in rows))
+    names = [plain(dependency_tool_label(owner)) for owner, *_ in rows]
+    name_width = max(len('Dependency source'), *map(len, names))
+    version_width = max(len('Tool version'), *(len(plain(row[0]['version'])) for row in rows))
     score_width = max(len('Top score'), *(len(severity_display(score)[0]) for _, score, _, _ in rows))
-    header = f"  {'Tool':<{name_width}}  {'Installed':<{version_width}}  {'Top score':<{score_width}}  {'Matches':>7}  {'With a fix':>10}"
+    header = f"  {'Dependency source':<{name_width}}  {'Tool version':<{version_width}}  {'Top score':<{score_width}}  {'Matches':>7}  {'With a fix':>10}"
     wide = len(header) <= console.columns
     if wide:
         console.say(console.paint(header, '1'))
@@ -1393,7 +1409,7 @@ def dependency_table(console, rows):
             colored = console.paint(severity.ljust(score_width), color)
             console.say(f'  {name:<{name_width}}  {version:<{version_width}}  {colored}  {count:>7}  {fixes:>10}')
         else:
-            console.line(f'{name} {version} · {severity}', indent=2, color='1')
+            console.line(f'{dependency_tool_label(owner, with_version=True)} · {severity}', indent=2, color='1')
             console.line(f"{plural(count, 'match', 'matches')} · {fixes} with fixes", indent=4)
 
 
@@ -1411,7 +1427,14 @@ def dependency_detail(console, owner):
     for f in sorted(findings, key=lambda f: (-advisory_score(f), f['package'], f['version'], f['id'])):
         severity, _ = severity_display(advisory_score(f))
         console.say()
-        console.line(f"{f['package']} {f['version']}  ·  {severity}", indent=2, color='1')
+        routes = component_routes(f)
+        package = f"{f['package']} {f['version']}"
+        if len(routes) == 1 and () not in routes:
+            package = ' → '.join((label(owner['tool']), *next(iter(routes)), package))
+        console.line(f"{package}  ·  {severity}", indent=2, color='1')
+        if len(routes) > 1:
+            for route in sorted(routes):
+                console.line(' → '.join((label(owner['tool']), *route, f['package'])), indent=4)
         if f.get('summary'):
             console.line(f['summary'].replace('`', ''), indent=4)
         fixes = ', '.join(f.get('fixed_versions', []))
@@ -1590,8 +1613,17 @@ def main(argv=None):
                 console.starting(name, args.check)
                 stage_started = time.monotonic()
                 observation_errors = []
+                unverified_stages = set()
                 def observe(when):
                     try:
+                        if name == 'setup':
+                            values, errors = inventory()
+                            unverified_stages.update(errors)
+                            for section, error in errors.items():
+                                detail = f'{when}: {label(section)}: {error}'
+                                observation_errors.append(detail)
+                                log.write(f'[{now()}] {name} observation: {detail}\n')
+                            return values
                         return snapshot(name)
                     except Exception as error:
                         detail = f'{when}: {error}'
@@ -1621,7 +1653,8 @@ def main(argv=None):
                     log.seek(0, 2)
                     after = observe('after')
                     result['before'], result['after'] = before, after
-                    result['changes'] = compare(before, after) if before is not None and after is not None else []
+                    result['changes'] = (compare(before, after, unverified_stages=unverified_stages)
+                                         if before is not None and after is not None else [])
                     # A failed install can still have changed a subset of artifacts.
                     if name.startswith('brew-cask:') and result['state'] == 'deferred-running-app' and not result.get('plans'):
                         log.seek(output_start)
@@ -1661,8 +1694,13 @@ def main(argv=None):
                 # A fresh process reads the pulled manifest before applying it.
                 # Native packages use their guarded per-package stages below.
                 # Reloading our own LaunchAgent would interrupt this process.
-                skip = 'packages,macos-launchd-agents' if args.scheduled else 'packages'
-                step('setup', lambda: command([MISE, 'bootstrap', '--skip', skip, '--skip-dirty', '-y'], log))
+                # Dotfiles (including their font hook) have a dedicated stage.
+                # Apply the final MarkText and completion hooks after upgrading tools.
+                skip = 'packages,dotfiles'
+                if args.scheduled:
+                    skip += ',macos-launchd-agents'
+                setup_env = dict(ENV, HOST_MAINTENANCE_POST_UPGRADE='1')
+                step('setup', lambda: command([MISE, 'bootstrap', '--skip', skip, '--skip-dirty', '-y'], log, env=setup_env))
                 step('mise', lambda: command([MISE, 'self-update', '-y', '--no-plugins'], log, timeout=600))
             step('tools', lambda: command([MISE, 'outdated', '--global', '--json'] if args.check else [MISE, 'upgrade', '--global', '-y'], log))
             step('audit', lambda: audit_tools(log, console))
@@ -1672,7 +1710,10 @@ def main(argv=None):
 
             if not args.check:
                 step('shell-completions', lambda: command([MISE, 'run', 'shell:completions'], log, timeout=120))
-            step('variable-fonts', lambda: command([sys.executable, CONFIG.parent / 'scripts/google-fonts.py', '--check' if args.check else '--deploy'], log, timeout=300))
+            if args.check:
+                step('variable-fonts', lambda: command([sys.executable, CONFIG.parent / 'scripts/google-fonts.py', '--check'], log, timeout=300))
+            else:
+                step('variable-fonts', lambda: command([MISE, 'bootstrap', '--only', 'dotfiles', '--skip-dirty', '-y'], log, timeout=300))
             step('marktext', lambda: marktext(args.check, log, console=console))
             packages = tomllib.loads(CONFIG.read_text())['bootstrap']['packages']
             for key in packages:
