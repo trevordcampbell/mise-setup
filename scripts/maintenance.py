@@ -1107,7 +1107,10 @@ def show_history(console, limit):
             audit = report.get('results', {}).get('audit', {})
             audit_status = (' · ' + plural(len(audit['vulnerabilities']), 'advisory', 'advisories')
                             if 'vulnerabilities' in audit else ' · audit unavailable' if audit else '')
-            console.say(f"{local}  {report['origin']:9} {report['state']:11} {len(report.get('changes', []))} changes · {len(report.get('since_previous_run', []))} between runs · {len(report.get('errors', []))} errors{audit_status}")
+            changes = plural(len(report.get('changes', [])), 'change')
+            errors = plural(len(report.get('errors', [])), 'error')
+            between = len(report.get('since_previous_run', []))
+            console.say(f"{local}  {report['origin']:9} {report['state']:11} {changes} · {between} between runs · {errors}{audit_status}")
     return 0
 
 def main(argv=None):
