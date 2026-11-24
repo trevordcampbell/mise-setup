@@ -15,6 +15,7 @@ jobs:
         include:
           - os: ubuntu-latest
             python: '3.11'
+            mise: '2026.11.12'
           - os: macos-latest
             python: '3.15'
     runs-on: ${{ matrix.os }}
@@ -28,7 +29,8 @@ jobs:
           python-version: ${{ matrix.python }}
       - uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
         with:
-          version: '2026.10.8'
+          # The action defaults to the latest release when the matrix omits mise.
+          version: ${{ matrix.mise }}
           install: false
           cache: false
       - name: Test without an installed host setup

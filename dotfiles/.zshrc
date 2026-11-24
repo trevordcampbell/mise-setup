@@ -103,8 +103,8 @@ plugins=(
 	zsh-syntax-highlighting
 )
 
-# Complete mise tools, commands, and tasks using the installed script.
-fpath=("$HOME/.local/share/zsh/site-functions" $fpath)
+# Load the Mise and Codex completions before Oh My Zsh initializes completion.
+fpath=("${XDG_DATA_HOME:-$HOME/.local/share}/zsh/site-functions" $fpath)
 # Mise maintenance updates Oh My Zsh and its plugin repositories.
 zstyle ':omz:update' mode disabled
 source "$ZSH/oh-my-zsh.sh"

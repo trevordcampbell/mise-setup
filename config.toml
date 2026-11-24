@@ -31,6 +31,7 @@ gh = "latest"
 "github:skw398/scap" = { version = "latest", asset_pattern = "scap.zip" }
 uv = "latest"
 claude = "latest"
+codex = "latest"
 
 [bootstrap.packages]
 # Deliberately installed tools; mise resolves their native library dependencies.
@@ -137,9 +138,22 @@ dir = "~"
 run = ["mise bootstrap repos update --skip-dirty -y", "mise run shell:completions"]
 
 [tasks."shell:completions"]
-description = "Generate completion for the installed mise version"
+description = "Refresh Zsh completions for Mise and the installed Codex CLI"
 dir = "~"
-run = 'mkdir -p "$HOME/.local/share/zsh/site-functions" && "$HOME/.local/bin/mise" completion zsh > "$HOME/.local/share/zsh/site-functions/_mise"'
+run = '''
+set -eu
+mise="$HOME/.local/bin/mise"
+"$mise" completion zsh --install
+codex_bin=$("$mise" -C "$HOME" which codex)
+dir="${XDG_DATA_HOME:-$HOME/.local/share}/zsh/site-functions"
+mkdir -p "$dir"
+tmp=$(mktemp "$dir/.codex-completion.XXXXXXXX")
+trap 'rm -f "$tmp"' EXIT
+"$codex_bin" completion zsh > "$tmp"
+if ! cmp -s "$tmp" "$dir/_codex"; then
+  mv -f "$tmp" "$dir/_codex"
+fi
+'''
 
 [bootstrap.hooks]
 # Install tools before fonts and RunAtLoad update jobs on a fresh machine.

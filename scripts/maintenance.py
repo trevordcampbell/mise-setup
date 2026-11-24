@@ -573,7 +573,9 @@ def snapshot(name):
                                   dirty=bool(read_command(['git', '-C', directory, 'status', '--porcelain'])))
         return result
     if name == 'shell-completions':
-        return {'completions': entity('Shell completions', digest(HOME / '.local/share/zsh/site-functions/_mise'), 'content')}
+        directory = Path(os.environ.get('XDG_DATA_HOME') or HOME / '.local/share') / 'zsh/site-functions'
+        return {'completions': entity('Mise completions', digest(directory / '_mise'), 'content'),
+                'codex-completions': entity('Codex completions', digest(directory / '_codex'), 'content')}
     if name == 'variable-fonts':
         revisions_path = FONT_ROOT / 'revisions.json'
         revisions = json.loads(revisions_path.read_text()) if revisions_path.exists() else {}
