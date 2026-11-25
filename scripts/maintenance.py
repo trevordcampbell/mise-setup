@@ -128,6 +128,8 @@ def outcome(result):
         return '↑', '; '.join(format_change(c, planned=True) for c in result['plans']), '33'
     if state == 'availability-unknown':
         return '!', 'Update availability unverified', '33'
+    if result.get('plan_issues'):
+        return '!', 'Update preview incomplete', '33'
     if result.get('observation_errors'):
         return '!', 'Completed; change verification unavailable', '33'
     if state == 'update-available':
@@ -280,6 +282,7 @@ class Console:
                 limits.append(f'{title}: {reason}')
             if result.get('observation_errors'):
                 limits.append(f"{title}: change verification incomplete ({', '.join(result['observation_errors'])}).")
+            limits.extend(result.get('plan_issues', []))
             for note in messages:
                 if note in ('installed app is running and updates itself', 'installed app is current, newer, or incomparable',
                             'Native check could not prove an eligible update; see the detailed log.') or (
@@ -354,6 +357,8 @@ class Console:
             self.section('Dependency advisories', review, '33')
         self.section('Waiting', waiting, '33')
         self.section('Available to update', available, '1')
+        if preview and results.get('mise', {}).get('plans'):
+            self.say('  Mise updates automatically. To update now, run mise run maintenance:update.')
         heading = 'Observed during preview' if preview else 'Changed this run'
         self.section(heading + (' (partial results)' if failures else ''), changed_rows(changes), '32')
         self.section('Changed before this run', changed_rows(report.get('since_previous_run', [])), '1')
@@ -813,6 +818,8 @@ def snapshot(name):
         result = {}
         for path in config['bootstrap']['repos']:
             directory = Path(path).expanduser()
+            if not directory.exists() or (directory.is_dir() and not any(directory.iterdir())):
+                continue
             result[path] = entity('Mise setup' if directory == CONFIG.parent else directory.name,
                                   read_command(['git', '-C', directory, 'rev-parse', 'HEAD']), 'revision',
                                   dirty=bool(read_command(['git', '-C', directory, 'status', '--porcelain'])))
@@ -909,7 +916,89 @@ def json_document(text):
     raise RuntimeError('No structured update plan was returned')
 
 
+def branch_merge_base(path, current, target_ref, target):
+    git = ['git', '-C', path]
+    try:
+        return read_command([*git, 'merge-base', current, target])
+    except RuntimeError:
+        pass  # Shallow checkouts often lack the new objects.
+    url = read_command([*git, 'remote', 'get-url', 'origin'])
+    if url.startswith(('./', '../')):
+        url = str((path / url).resolve())
+    # Keep even FETCH_HEAD and the checkout's remote-tracking refs untouched.
+    with tempfile.TemporaryDirectory() as scratch:
+        probe = ['git', '-C', scratch]
+        read_command([*probe, 'init', '--bare', '-q'])
+        read_command([*probe, 'fetch', '--no-tags', '--depth=64', '--filter=tree:0', '--', url, target_ref])
+        if read_command([*probe, 'rev-parse', 'FETCH_HEAD']) != target:
+            raise ValueError('origin changed during the check; retry the preview')
+        if current in read_command([*probe, 'rev-list', 'FETCH_HEAD']).splitlines():
+            return current
+    return None
+
+
+def repository_plan(row):
+    """Resolve the requested revision without changing refs in the managed checkout."""
+    path = Path(row['path'])
+    missing = row['state'] == 'missing'
+    current = row['current_sha']
+    ref = row['ref'] or ('HEAD' if missing else row['current_ref'])
+    if not ref or (ref == 'HEAD' and not missing):
+        raise ValueError('detached checkout has no branch to update')
+    git = ['git'] if missing else ['git', '-C', path]
+    remote = row['url'] if missing else 'origin'
+    branch, tag = 'refs/heads/' + ref, 'refs/tags/' + ref
+    refs = [ref] if ref.startswith('refs/') or ref == 'HEAD' else [branch, tag]
+    listed = read_command([*git, 'ls-remote', '--', remote, *refs, *(r + '^{}' for r in refs)])
+    tips = {name: sha for sha, name in (line.split('\t') for line in listed.splitlines())}
+    target_ref = next((r for r in refs if r in tips), None)
+    if target_ref is None and not missing and re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', ref):
+        target = read_command([*git, 'rev-parse', '--verify', ref + '^{commit}'])
+    elif target_ref is None:
+        raise ValueError(f'origin did not advertise {ref} as a branch or tag')
+    else:
+        target = tips.get(target_ref + '^{}', tips[target_ref])
+    if not missing and target_ref and target_ref.startswith('refs/heads/'):
+        if target_ref.removeprefix('refs/heads/') != row['current_ref']:
+            raise ValueError(f'checkout would switch to {ref}; its fast-forward is unverified')
+        if current != target:
+            base = branch_merge_base(path, current, target_ref, target)
+            if base == target:
+                return None  # Local branch is already ahead.
+            if base != current:
+                raise ValueError(f'could not verify a fast-forward from {current[:8]} to {target[:8]}')
+    if target == current:
+        return None
+    return {'name': 'Mise setup' if path == CONFIG.parent else path.name,
+            'kind': 'revision', 'before': current, 'after': target, 'id': row['path_raw']}
+
+
+def repository_preview(rows):
+    plans, issues = [], []
+    for row in rows:
+        state = row['state']
+        if state == 'dirty' or (state == 'current' and row['ref']):
+            continue
+        try:
+            if state not in ('missing', 'current', 'differs'):
+                raise ValueError(row.get('reason') or f'unrecognized repository status {state!r}')
+            plan = repository_plan(row)
+            if plan:
+                plans.append(plan)
+        except (ValueError, RuntimeError, OSError, subprocess.TimeoutExpired) as error:
+            issues.append(f"{row['path_raw']}: {error}")
+    return {'plans': plans, 'plan_issues': issues}
+
+
 def preview_result(name, text, before):
+    if name == 'mise':
+        version = json_document(text)
+        current, latest = version['version'].split()[0], version['latest']
+        if latest is None:
+            return {'plan_issues': ['Mise could not look up its latest eligible release.']}
+        if release_version(latest) > release_version(current):
+            return {'plans': [{'name': 'Mise', 'kind': 'version', 'before': current, 'after': latest}]}
+        return {'plans': []}
     if name == 'tools':
         records = json_document(text)
         return {'plans': [{'name': label(key), 'kind': 'version', 'before': r['current'], 'after': r['latest']}
@@ -923,7 +1012,7 @@ def preview_result(name, text, before):
         return {'plans': [{'name': 'Rustup', 'kind': 'version', 'before': old, 'after': new} for old, new in matches],
                 'plan_unverified': 'update available' in text.lower() and not matches}
     if name == 'shell-repositories':
-        return {'notes': re.findall(r'(?mi)^(?:mise\s+)?(.*(?:would update|would fast-forward|would clone).*)$', text)}
+        return repository_preview(json_document(text)['repos'])
     if name == 'brew' or name.startswith('brew-cask:'):
         notes = [note.strip() for note in re.findall(r'(?m)^.*(?:skipped:|WARN\s+)(.+)$', text)]
         plans = native_preview(text, before)
@@ -1243,6 +1332,33 @@ def native_cask_update(key, check, log, command):
     return cask_result(text, False)
 
 
+def doctor_health():
+    result = subprocess.run([MISE, 'doctor', '--json'], cwd=HOME, env=ENV,
+                            capture_output=True, text=True, timeout=30)
+    # Doctor returns 1 for diagnosed errors and still writes a valid JSON report.
+    # Keep only the diagnostics; the full output includes the process environment.
+    if not result.stdout.strip():
+        raise RuntimeError(result.stderr.strip() or f'Mise doctor returned no report (exit {result.returncode})')
+    data = json.loads(result.stdout)
+    installed = data['version'].split()[0]
+    errors, warnings, pending = data.get('errors', []), [], None
+    for warning in data.get('warnings', []):
+        match = re.fullmatch(r'new mise version (\d+\.\d+\.\d+) available, currently on (\d+\.\d+\.\d+)', warning)
+        if (match and data.get('self_update_available') is True and match[2] == installed
+                and release_version(match[1]) > release_version(installed)):
+            pending = {'installed': installed, 'eligible': match[1]}
+        else:
+            warnings.append(warning)
+    details = [*errors, *warnings]
+    if result.returncode and not errors:
+        details.append(f'Mise doctor exited with status {result.returncode}')
+    if pending:
+        details.append(f"Mise {installed} → {pending['eligible']} on the next maintenance run")
+    state = 'failed' if result.returncode or errors else 'warning' if warnings else 'healthy'
+    return {'state': state, 'detail': ' · '.join(details) or 'No Mise doctor errors or warnings',
+            'errors': errors, 'warnings': warnings, 'pending_update': pending}
+
+
 def health():
     checks = {}
     def check(name, action):
@@ -1250,11 +1366,7 @@ def health():
             checks[name] = action()
         except Exception as error:
             checks[name] = {'state': 'failed', 'detail': str(error)}
-    def doctor():
-        output = read_command([MISE, 'doctor'])
-        warning = re.search(r'\d+ warnings? found:\s*(.*?)\n\nNo problems found', output, re.S)
-        return {'state': 'warning' if warning else 'healthy', 'detail': warning[1].strip() if warning else 'No Mise doctor errors or warnings', 'output': output}
-    check('mise-doctor', doctor)
+    check('mise-doctor', doctor_health)
     def service(name):
         output = read_command(['/bin/launchctl', 'print', f'gui/{os.getuid()}/dev.mise.{name}'])
         code = re.search(r'last exit code = (\d+)', output)
@@ -1821,7 +1933,8 @@ def main(argv=None):
                     console.finished(name, result)
                 finally:
                     console.stop_progress()
-            step('shell-repositories', lambda: command([MISE, 'bootstrap', 'repos', 'update', '--skip-dirty', '-y'] + (['--dry-run'] if args.check else []), log, timeout=600))
+            repo_args = ['status', '--json'] if args.check else ['update', '--skip-dirty', '-y']
+            step('shell-repositories', lambda: command([MISE, 'bootstrap', 'repos', *repo_args], log, timeout=600))
             if not args.check:
                 # A fresh process reads the pulled manifest before applying it.
                 # Native packages use their guarded per-package stages below.
@@ -1834,6 +1947,8 @@ def main(argv=None):
                 setup_env = dict(ENV, HOST_MAINTENANCE_POST_UPGRADE='1')
                 step('setup', lambda: command([MISE, 'bootstrap', '--skip', skip, '--skip-dirty', '-y'], log, env=setup_env))
                 step('mise', lambda: command([MISE, 'self-update', '-y', '--no-plugins'], log, timeout=600))
+            else:
+                step('mise', lambda: command([MISE, 'version', '--json'], log))
             step('tools', lambda: command([MISE, 'outdated', '--global', '--json'] if args.check else [MISE, 'upgrade', '--global', '-y'], log))
             step('audit', lambda: audit_tools(log, console))
             step('dependency-audit', lambda: dependency_audit.scan(MISE, HOME, ENV, log))

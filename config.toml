@@ -102,7 +102,7 @@ run = 'sh "$HOME/.config/mise/scripts/run-maintenance.sh"'
 [tasks."maintenance:check"]
 raw = true
 quiet = true
-description = "Preview global tool, package, and MarkText updates"
+description = "Preview eligible Mise, tool, repository, and host package updates"
 dir = "~"
 usage = '''
 flag "--verbose" help="Show each stage and stream command output"

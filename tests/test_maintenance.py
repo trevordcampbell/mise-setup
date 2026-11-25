@@ -569,6 +569,10 @@ class MaintenanceOutputTests(unittest.TestCase):
             def command(args, log, **kwargs):
                 if 'outdated' in args:
                     log.write('{}\n')
+                elif 'repos' in args and 'status' in args:
+                    log.write('{"repos": []}\n')
+                elif 'version' in args:
+                    log.write('{"version": "2026.11.12 macos-arm64", "latest": "2026.11.12"}\n')
                 elif '--check' in args:
                     log.write('{"files": [], "revisions": {}}\n')
                 else:
@@ -670,6 +674,32 @@ class MaintenanceOutputTests(unittest.TestCase):
         with redirect_stdout(self.stdout):
             self.assertEqual(maintenance.main(['--status', '--json']), 0)
         self.assertEqual(json.loads(self.stdout.getvalue()), {'state': 'not-run-yet'})
+
+    def test_preview_reports_eligible_mise_and_repository_plans_without_applying(self):
+        calls = []
+        row = {'state': 'differs', 'ref': 'main', 'path_raw': '~/.oh-my-zsh'}
+        expected = {'name': '.oh-my-zsh', 'kind': 'revision', 'before': 'a' * 40, 'after': 'b' * 40}
+        def command(args, log, **kwargs):
+            calls.append(list(args))
+            data = {}
+            if 'repos' in args:
+                self.assertEqual(args[-2:], ['status', '--json'])
+                data = {'repos': [row]}
+            elif 'version' in args:
+                data = {'version': '2026.11.12 macos-arm64', 'latest': '2026.11.13'}
+            elif '--check' in args:
+                data = {'files': [], 'revisions': {}}
+            log.write(json.dumps(data) + '\n')
+        with patch.object(maintenance, 'repository_plan', return_value=expected):
+            self.assertEqual(self.invoke(['--check'], command=command), 0)
+        self.assertFalse(any('self-update' in call for call in calls))
+        report = maintenance.load_report(self.state / 'last-check.json')
+        plans = {p['stage']: p for p in report['planned_changes']}
+        self.assertEqual(plans['mise']['after'], '2026.11.13')
+        self.assertEqual(plans['shell-repositories']['after'], 'b' * 40)
+        self.assertFalse(report['changes'])
+        self.assertIn('Oh My Zsh: aaaaaaaa → bbbbbbbb', self.stdout.getvalue())
+        self.assertIn('Mise: 2026.11.12 → 2026.11.13', self.stdout.getvalue())
 
     def test_status_reads_older_report_format(self):
         self.state.mkdir()
@@ -858,6 +888,56 @@ class DependencyReportTests(unittest.TestCase):
 
 
 class ChangeReportingTests(unittest.TestCase):
+    def test_self_update_preview_obeys_the_native_eligible_release(self):
+        def preview(latest):
+            return maintenance.preview_result('mise', json.dumps({'version': '2026.11.9 macos-arm64', 'latest': latest}), {})
+        self.assertEqual(preview('2026.11.13')['plans'], [
+            {'name': 'Mise', 'kind': 'version', 'before': '2026.11.9', 'after': '2026.11.13'}])
+        self.assertFalse(preview('2026.11.9')['plans'])
+        self.assertTrue(preview(None)['plan_issues'])
+
+    def test_repository_preview_proves_remote_updates_without_fetching_into_checkout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            origin, checkout = root / 'origin', root / '.oh-my-zsh'
+            def git(path, *args):
+                return maintenance.read_command(['git', '-C', path, *args])
+            def commit(path, value):
+                (path / value).write_text(value)
+                git(path, 'add', value)
+                git(path, '-c', 'commit.gpgsign=false', '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+                    'commit', '-qm', value)
+                return git(path, 'rev-parse', 'HEAD')
+            origin.mkdir()
+            git(origin, 'init', '-q', '-b', 'main')
+            old = commit(origin, 'first')
+            git(root, 'clone', '-q', '--depth=1', origin.as_uri(), checkout)
+            new = commit(origin, 'second')
+            row = {'state': 'differs', 'path': str(checkout), 'path_raw': '~/.oh-my-zsh',
+                   'current_ref': 'main', 'current_sha': old, 'ref': 'main', 'url': origin.as_uri()}
+            refs = git(checkout, 'show-ref')
+            fetched = checkout / '.git/FETCH_HEAD'
+            stamp = fetched.read_bytes() if fetched.exists() else None
+            result = maintenance.repository_preview([row])
+            self.assertEqual(result['plan_issues'], [])
+            self.assertEqual((result['plans'][0]['before'], result['plans'][0]['after']), (old, new))
+            self.assertEqual(git(checkout, 'show-ref'), refs)
+            self.assertEqual(fetched.read_bytes() if fetched.exists() else None, stamp)
+            self.assertEqual(maintenance.repository_preview([dict(row, state='dirty')])['plans'], [])
+            conflict = maintenance.repository_preview([dict(row, state='conflict', reason='different origin')])
+            self.assertEqual(conflict['plan_issues'], ['~/.oh-my-zsh: different origin'])
+            missing = dict(row, state='missing', path=str(root / 'absent'), current_sha=None, current_ref=None)
+            clone = maintenance.repository_preview([missing])
+            self.assertEqual((clone['plans'][0]['before'], clone['plans'][0]['after']), (None, new))
+            self.assertFalse((root / 'absent').exists())
+            unknown = maintenance.repository_preview([dict(row, ref='deleted-branch')])
+            self.assertFalse(unknown['plans'])
+            self.assertTrue(unknown['plan_issues'])
+            local = commit(checkout, 'local')
+            diverged = maintenance.repository_preview([dict(row, current_sha=local)])
+            self.assertFalse(diverged['plans'])
+            self.assertIn('could not verify a fast-forward', diverged['plan_issues'][0])
+
     def test_comparison_includes_installs_removals_and_commits_but_not_metadata(self):
         before = {'app': maintenance.entity('Postman', '1.0'),
                   'repo': maintenance.entity('repo', 'a' * 40, 'revision', dirty=False),
@@ -1125,7 +1205,7 @@ class SyncHealthHistoryTests(unittest.TestCase):
         self.assertEqual(self.fixture.invoke(['--json']), 0)
         self.assertEqual(maintenance.load_report(maintenance.STATE / 'last-scheduled.json'), scheduled)
         self.assertEqual(maintenance.load_report(maintenance.STATE / 'last-manual.json')['state'], 'success')
-        with patch.object(maintenance, 'read_command', return_value='state = running\n--scheduled\nlast exit code = 0'):
+        with patch.object(maintenance, 'doctor_health', return_value={'state': 'healthy', 'detail': 'ok'}), patch.object(maintenance, 'read_command', return_value='state = running\n--scheduled\nlast exit code = 0'):
             report = maintenance.health()
         self.assertEqual(report['state'], 'attention-needed')
         self.assertEqual(report['checks']['scheduled-freshness']['state'], 'failed')
@@ -1146,6 +1226,9 @@ class SyncHealthHistoryTests(unittest.TestCase):
         self.assertFalse(any('--deploy' in c for c in calls))
 
     def test_health_detects_missing_stale_and_failed_services(self):
+        doctor = patch.object(maintenance, 'doctor_health', return_value={'state': 'healthy', 'detail': 'ok'})
+        doctor.start()
+        self.addCleanup(doctor.stop)
         with patch.object(maintenance, 'read_command', side_effect=RuntimeError('not loaded')):
             self.assertEqual(maintenance.health()['state'], 'attention-needed')
         maintenance.atomic_write(maintenance.STATE / 'last-scheduled.json', json.dumps({'state': 'success', 'finished_at': (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()}))
@@ -1157,11 +1240,26 @@ class SyncHealthHistoryTests(unittest.TestCase):
         with patch.object(maintenance, 'read_command', return_value='state = running\n--scheduled\nlast exit code = 2'):
             self.assertEqual(maintenance.health()['checks']['mise-maintenance']['state'], 'failed')
 
-    def test_doctor_warnings_are_not_silently_healthy(self):
-        with patch.object(maintenance, 'read_command', return_value='1 warning found:\n\n1. last auto_update failed\n\nNo problems found'):
-            report = maintenance.health()
-        self.assertEqual(report['checks']['mise-doctor']['state'], 'warning')
-        self.assertEqual(report['state'], 'attention-needed')
+    def test_only_doctors_managed_self_update_notice_is_informational(self):
+        notice = 'new mise version 2026.11.13 available, currently on 2026.11.12'
+        data = {'version': '2026.11.12 macos-arm64', 'self_update_available': True}
+        def doctor(code=0, **fields):
+            result = maintenance.subprocess.CompletedProcess([], code, json.dumps(dict(data, **fields)), '')
+            with patch.object(maintenance.subprocess, 'run', return_value=result):
+                return maintenance.doctor_health()
+        pending = doctor(warnings=[notice])
+        self.assertEqual(pending['state'], 'healthy')
+        self.assertEqual(pending['pending_update'], {'installed': '2026.11.12', 'eligible': '2026.11.13'})
+        self.assertEqual(doctor()['state'], 'healthy')
+        mixed = doctor(warnings=[notice, 'last auto_update failed'])
+        self.assertEqual(mixed['state'], 'warning')
+        self.assertIn('last auto_update failed', mixed['detail'])
+        self.assertEqual(doctor(warnings=[notice], self_update_available=False)['state'], 'warning')
+        self.assertEqual(doctor(warnings=[notice.replace('currently on 2026.11.12', 'currently on 1.0.0')])['state'], 'warning')
+        failed = doctor(1, errors=['invalid configuration'], warnings=[notice])
+        self.assertEqual(failed['state'], 'failed')
+        self.assertIn('invalid configuration', failed['detail'])
+        self.assertEqual(doctor(1)['state'], 'failed')
 
     def test_history_is_bounded_and_keeps_latest_reports(self):
         for i in range(7):
