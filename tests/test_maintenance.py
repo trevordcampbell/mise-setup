@@ -779,7 +779,7 @@ class MaintenanceOutputTests(unittest.TestCase):
             return f'state = running\n--scheduled\nlast exit code = {code}'
         with patch.object(maintenance, 'doctor_health', return_value=doctor), patch.object(maintenance, 'read_command', side_effect=services):
             checks = maintenance.health()['checks']
-            self.assertEqual(checks['mise-maintenance']['last_skip'], skip)
+            self.assertEqual(checks['scheduled-attempt']['last_skip'], skip)
             self.assertEqual(checks['scheduled-freshness']['state'], 'failed')
             previous = {'state': 'success', 'finished_at': skip['started_at']}
             maintenance.atomic_write(self.state / 'last-scheduled.json', json.dumps(previous))
@@ -787,8 +787,12 @@ class MaintenanceOutputTests(unittest.TestCase):
             self.assertEqual(maintenance.load_report(self.state / 'last-scheduled.json'), previous)
             report = maintenance.health()
             self.assertEqual(report['state'], 'attention-needed')
-            self.assertEqual(report['checks']['mise-maintenance']['last_skip'], skip)
+            self.assertEqual(report['checks']['scheduled-attempt']['last_skip'], skip)
             self.assertEqual(report['checks']['scheduled-freshness']['state'], 'healthy')
+            with patch.object(maintenance, 'read_command', side_effect=RuntimeError('agent not loaded')):
+                checks = maintenance.health()['checks']
+                self.assertEqual(checks['scheduled-attempt']['last_skip'], skip)
+                self.assertEqual(checks['mise-maintenance']['state'], 'failed')
         self.assertEqual(self.invoke(['--scheduled']), 0)
         with patch.object(maintenance, 'doctor_health', return_value=doctor), patch.object(maintenance, 'read_command', return_value='state = running\n--scheduled\nlast exit code = 0'):
             self.assertEqual(maintenance.health()['state'], 'healthy')

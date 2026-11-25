@@ -1448,28 +1448,34 @@ def health():
     checks = {}
     def check(name, action):
         try:
-            checks[name] = action()
+            result = action()
+            if result is not None:
+                checks[name] = result
         except Exception as error:
             checks[name] = {'state': 'failed', 'detail': str(error)}
     check('mise-doctor', doctor_health)
+    def last_attempt():
+        skip = load_report(STATE / 'last-scheduled-skip.json')
+        if skip:
+            last = load_report(STATE / 'last-scheduled.json')
+            when = datetime.fromisoformat(skip['finished_at'])
+            if not last or when > datetime.fromisoformat(last['finished_at']):
+                stamp = when.astimezone().strftime('%Y-%m-%d %H:%M %Z')
+                return {'state': 'warning', 'detail': f"Skipped at {stamp} after waiting {skip['waited_seconds']:.0f}s for another run to finish.",
+                        'last_skip': skip}
+    check('scheduled-attempt', last_attempt)
     def service(name):
         output = read_command(['/bin/launchctl', 'print', f'gui/{os.getuid()}/dev.mise.{name}'])
         code = re.search(r'last exit code = (\d+)', output)
-        if name == 'mise-tool-update' and 'state = running' not in output:
-            raise RuntimeError('Tool update watcher is loaded but not running')
         if name == 'mise-maintenance':
             if '--scheduled' not in output:
                 raise RuntimeError('Loaded maintenance agent lacks scheduled-run tracking; run setup:sync')
-            skip = load_report(STATE / 'last-scheduled-skip.json')
-            if skip and (not code or int(code[1]) in (0, os.EX_TEMPFAIL)):
-                last = load_report(STATE / 'last-scheduled.json')
-                when = datetime.fromisoformat(skip['finished_at'])
-                if not last or when > datetime.fromisoformat(last['finished_at']):
-                    stamp = when.astimezone().strftime('%Y-%m-%d %H:%M %Z')
-                    return {'state': 'warning', 'detail': f"Skipped at {stamp} after waiting {skip['waited_seconds']:.0f}s for another run to finish.",
-                            'last_skip': skip}
+            if code and int(code[1]) == os.EX_TEMPFAIL and checks.get('scheduled-attempt', {}).get('last_skip'):
+                return {'state': 'healthy', 'detail': 'loaded'}
         if code and int(code[1]):
             raise RuntimeError(f'Last service exit code: {code[1]}')
+        if name == 'mise-tool-update' and 'state = running' not in output:
+            raise RuntimeError('Tool update watcher is loaded but not running')
         return {'state': 'healthy', 'detail': 'running' if 'state = running' in output else 'loaded; last exit successful' if code else 'loaded; has not exited yet'}
     for name in ['mise-tool-update', 'mise-maintenance']:
         check(name, lambda n=name: service(n))
