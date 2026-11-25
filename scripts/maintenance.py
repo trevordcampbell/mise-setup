@@ -36,6 +36,7 @@ HOME = Path.home()
 CONFIG = HOME / '.config/mise/config.toml'
 MISE = HOME / '.local/bin/mise'
 STATE = HOME / '.local/state/mise/maintenance'
+SCHEDULED_LOCK_WAIT = 120
 LOG = HOME / 'Library/Logs/mise-maintenance.log'
 APPLICATIONS = Path('/Applications')
 ENV = dict(os.environ, PATH=f'{HOME}/.local/bin:{HOME}/.local/share/mise/shims:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/bin:/bin:/usr/sbin:/sbin', MISE_YES='1')
@@ -47,6 +48,19 @@ for key in list(ENV):
 
 def now():
     return datetime.now(timezone.utc).isoformat()
+
+
+def acquire_update_lock(lock, wait_seconds):
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(1, remaining))
 
 
 def atomic_write(path, content):
@@ -249,6 +263,9 @@ class Console:
             return
         if report['state'] == 'already-running':
             self.say('Another maintenance run is active; skipped.')
+            return
+        if report['state'] == 'skipped-busy':
+            self.say(f"Scheduled maintenance skipped after waiting {report['waited_seconds']:.0f}s for another run to finish.")
             return
         if show_steps:
             stamp = report.get('started_at')
@@ -1438,12 +1455,21 @@ def health():
     def service(name):
         output = read_command(['/bin/launchctl', 'print', f'gui/{os.getuid()}/dev.mise.{name}'])
         code = re.search(r'last exit code = (\d+)', output)
-        if code and int(code[1]):
-            raise RuntimeError(f'Last service exit code: {code[1]}')
         if name == 'mise-tool-update' and 'state = running' not in output:
             raise RuntimeError('Tool update watcher is loaded but not running')
-        if name == 'mise-maintenance' and '--scheduled' not in output:
-            raise RuntimeError('Loaded maintenance agent lacks scheduled-run tracking; run setup:sync')
+        if name == 'mise-maintenance':
+            if '--scheduled' not in output:
+                raise RuntimeError('Loaded maintenance agent lacks scheduled-run tracking; run setup:sync')
+            skip = load_report(STATE / 'last-scheduled-skip.json')
+            if skip and (not code or int(code[1]) in (0, os.EX_TEMPFAIL)):
+                last = load_report(STATE / 'last-scheduled.json')
+                when = datetime.fromisoformat(skip['finished_at'])
+                if not last or when > datetime.fromisoformat(last['finished_at']):
+                    stamp = when.astimezone().strftime('%Y-%m-%d %H:%M %Z')
+                    return {'state': 'warning', 'detail': f"Skipped at {stamp} after waiting {skip['waited_seconds']:.0f}s for another run to finish.",
+                            'last_skip': skip}
+        if code and int(code[1]):
+            raise RuntimeError(f'Last service exit code: {code[1]}')
         return {'state': 'healthy', 'detail': 'running' if 'state = running' in output else 'loaded; last exit successful' if code else 'loaded; has not exited yet'}
     for name in ['mise-tool-update', 'mise-maintenance']:
         check(name, lambda n=name: service(n))
@@ -2000,11 +2026,17 @@ def main(argv=None):
         return 0
     STATE.mkdir(parents=True, exist_ok=True)
     with (STATE / 'update.lock').open('a') as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            console.summary({'state': 'already-running'})
-            return 0
+        scheduled_update = args.scheduled and not args.check
+        attempted_at, attempted = now(), time.monotonic()
+        if not acquire_update_lock(lock, SCHEDULED_LOCK_WAIT if scheduled_update else 0):
+            if not scheduled_update:
+                console.summary({'state': 'already-running'})
+                return 0
+            skip = {'origin': 'scheduled', 'state': 'skipped-busy', 'started_at': attempted_at,
+                    'finished_at': now(), 'waited_seconds': round(time.monotonic() - attempted, 3)}
+            atomic_write(STATE / 'last-scheduled-skip.json', json.dumps(skip, indent=2) + '\n')
+            console.summary(skip)
+            return os.EX_TEMPFAIL
         LOG.parent.mkdir(parents=True, exist_ok=True)
         rotate_logs()
         started = time.monotonic()
@@ -2115,7 +2147,16 @@ def main(argv=None):
                 step('mise', lambda: command([MISE, 'self-update', '-y', '--no-plugins'], log, timeout=600))
             else:
                 step('mise', lambda: command([MISE, 'version', '--json'], log))
-            step('tools', lambda: command([MISE, 'outdated', '--global', '--json'] if args.check else [MISE, 'upgrade', '--global', '-y'], log))
+            def global_tools():
+                if not args.check:
+                    return command([MISE, 'upgrade', '--global', '-y'], log)
+                command([MISE, 'outdated', '--global', '--json'], log)
+                # The structured plan lists eligible targets. The dry run also explains release-age holds.
+                try:
+                    command([MISE, 'upgrade', '--global', '--dry-run'], log, timeout=120)
+                except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+                    return {'state': 'checked', 'plan_issues': [f'Could not check global tool release-age holds: {error}']}
+            step('tools', global_tools)
             step('audit', lambda: audit_tools(log, console))
             step('dependency-audit', lambda: dependency_audit.scan(MISE, HOME, ENV, log, persist_reviews=atomic_write))
             if 'rust' in tomllib.loads(CONFIG.read_text()).get('tools', {}):

@@ -701,6 +701,38 @@ class MaintenanceOutputTests(unittest.TestCase):
         self.assertIn('Oh My Zsh: aaaaaaaa → bbbbbbbb', self.stdout.getvalue())
         self.assertIn('Mise: 2026.11.12 → 2026.11.13', self.stdout.getvalue())
 
+    def test_preview_release_age_holds_and_eligible_targets_are_independent(self):
+        warning = ('newer claude release 2.1.332 (released 2026-11-24, eligible 2026-11-25 20:32 EST) '
+                   'ignored by minimum_release_age (24h); latest eligible release is 2.1.331')
+        pending = {'uv': {'current': '0.13.9', 'latest': '0.13.10'}}
+        for targets, fail in [({}, False), (pending, False), (pending, True)]:
+            with self.subTest(targets=targets, fail=fail):
+                self.stdout.seek(0)
+                self.stdout.truncate()
+                calls = []
+                def command(args, log, **kwargs):
+                    if '--global' in args:
+                        calls.append(args[1:])
+                    if 'outdated' in args:
+                        log.write(json.dumps(targets) + '\n')
+                    elif args[1:] == ['upgrade', '--global', '--dry-run']:
+                        if fail:
+                            raise RuntimeError('release lookup timed out')
+                        log.write((f'mise WARN  {warning}\n') * 2)
+                self.assertEqual(self.invoke(['--check'], command=command), 0)
+                self.assertEqual(calls, [['outdated', '--global', '--json'], ['upgrade', '--global', '--dry-run']])
+                result = maintenance.load_report(self.state / 'last-check.json')['results']['tools']
+                self.assertEqual([p['name'] for p in result['plans']], list(targets))
+                self.assertEqual(result['changes'], [])
+                text = self.stdout.getvalue()
+                if fail:
+                    self.assertIn('release lookup timed out', result['plan_issues'][0])
+                    self.assertIn('Could not check global tool release-age holds', text)
+                else:
+                    self.assertEqual(result['notes'], [warning])
+                    self.assertIn('Waiting', text)
+                    self.assertEqual(text.count('Claude Code 2.1.332 becomes eligible 2026-11-25 20:32 EST.'), 1)
+
     def test_status_reads_older_report_format(self):
         self.state.mkdir()
         (self.state / 'last-run.json').write_text(json.dumps({'state': 'success', 'started_at': '2026-10-12T16:00:00+00:00', 'finished_at': '2026-10-12T16:00:02+00:00', 'results': {'tools': {'state': 'success'}}, 'errors': []}))
@@ -711,11 +743,55 @@ class MaintenanceOutputTests(unittest.TestCase):
 
     def test_lock_contention_still_emits_valid_json(self):
         self.state.mkdir()
-        with (self.state / 'update.lock').open('a') as lock:
+        with (self.state / 'update.lock').open('a') as lock, patch.object(maintenance.time, 'sleep') as sleep:
             maintenance.fcntl.flock(lock, maintenance.fcntl.LOCK_EX | maintenance.fcntl.LOCK_NB)
-            self.assertEqual(self.invoke(['--json']), 0)
-        self.assertEqual(json.loads(self.stdout.getvalue()), {'state': 'already-running'})
-        self.assertFalse((self.state / 'last-run.json').exists())
+            for args in [[], ['--check']]:
+                self.stdout.seek(0)
+                self.stdout.truncate()
+                self.assertEqual(self.invoke([*args, '--json']), 0)
+                self.assertEqual(json.loads(self.stdout.getvalue()), {'state': 'already-running'})
+            sleep.assert_not_called()
+        self.assertEqual([p.name for p in self.state.iterdir()], ['update.lock'])
+
+    def test_scheduled_run_acquires_lock_released_during_wait(self):
+        self.state.mkdir()
+        with (self.state / 'update.lock').open('a') as lock:
+            maintenance.fcntl.flock(lock, maintenance.fcntl.LOCK_EX)
+            with patch.object(maintenance.time, 'sleep', side_effect=lambda _: maintenance.fcntl.flock(lock, maintenance.fcntl.LOCK_UN)) as sleep:
+                self.assertEqual(self.invoke(['--scheduled', '--json']), 0)
+                sleep.assert_called_once()
+        self.assertEqual(maintenance.load_report(self.state / 'last-scheduled.json')['state'], 'success')
+        self.assertFalse((self.state / 'last-scheduled-skip.json').exists())
+
+    def test_busy_schedule_records_skip_without_replacing_run_or_freshness(self):
+        self.state.mkdir()
+        doctor = {'state': 'healthy', 'detail': 'ok'}
+        with (self.state / 'update.lock').open('a') as lock, patch.object(maintenance, 'SCHEDULED_LOCK_WAIT', 0.01):
+            maintenance.fcntl.flock(lock, maintenance.fcntl.LOCK_EX)
+            self.assertEqual(self.invoke(['--scheduled', '--json']), os.EX_TEMPFAIL)
+        skip = maintenance.load_report(self.state / 'last-scheduled-skip.json')
+        self.assertEqual(skip, json.loads(self.stdout.getvalue()))
+        self.assertEqual(skip['state'], 'skipped-busy')
+        self.assertGreaterEqual(skip['waited_seconds'], 0.01)
+        self.assertEqual(sorted(p.name for p in self.state.iterdir()), ['last-scheduled-skip.json', 'update.lock'])
+        def services(args):
+            code = 75 if args[-1].endswith('mise-maintenance') else 0
+            return f'state = running\n--scheduled\nlast exit code = {code}'
+        with patch.object(maintenance, 'doctor_health', return_value=doctor), patch.object(maintenance, 'read_command', side_effect=services):
+            checks = maintenance.health()['checks']
+            self.assertEqual(checks['mise-maintenance']['last_skip'], skip)
+            self.assertEqual(checks['scheduled-freshness']['state'], 'failed')
+            previous = {'state': 'success', 'finished_at': skip['started_at']}
+            maintenance.atomic_write(self.state / 'last-scheduled.json', json.dumps(previous))
+            self.assertEqual(self.invoke([]), 0)
+            self.assertEqual(maintenance.load_report(self.state / 'last-scheduled.json'), previous)
+            report = maintenance.health()
+            self.assertEqual(report['state'], 'attention-needed')
+            self.assertEqual(report['checks']['mise-maintenance']['last_skip'], skip)
+            self.assertEqual(report['checks']['scheduled-freshness']['state'], 'healthy')
+        self.assertEqual(self.invoke(['--scheduled']), 0)
+        with patch.object(maintenance, 'doctor_health', return_value=doctor), patch.object(maintenance, 'read_command', return_value='state = running\n--scheduled\nlast exit code = 0'):
+            self.assertEqual(maintenance.health()['state'], 'healthy')
 
     def test_verbose_streams_partial_output_before_process_finishes(self):
         visible = threading.Event()
