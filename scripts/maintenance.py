@@ -446,6 +446,28 @@ class CaskDownloadProgress:
         return f'Downloading {amount}{self.speed}'
 
 
+def command_failure(command, code, tail):
+    lines = [plain(line) for line in tail.splitlines() if line.strip()]
+    footer = re.compile(r'^mise\s+(?:ERROR\s+)?(?:Version:|Run with --verbose\b)', re.I)
+    lines = [line for line in lines if not footer.match(line)]
+    mise_errors = [m[1] for line in lines if (m := re.match(r'^mise\s+ERROR\s+(.+)$', line))]
+    detail = next((line for line in reversed(lines) if re.search(r'error|failed|denied', line, re.I)), None)
+    cause = mise_errors[-1] if mise_errors else detail or (lines[-1] if lines else 'No diagnostic output')
+    context = next((line for line in mise_errors if re.match(r'(?:failed|unable) to (?:install|update|upgrade|download)\b', line, re.I)), '')
+    if context and context != cause:
+        cause = context if cause.casefold() in context.casefold() else f'{context} · {cause}'
+    operation = Path(command[0]).name
+    if operation == 'mise':
+        # Only include Mise's command words, never dump arbitrary shell arguments.
+        words = []
+        for arg in command[1:]:
+            if not re.fullmatch(r'[a-z][a-z0-9:-]*', arg):
+                break
+            words.append(arg)
+        operation = ' '.join([operation, *words])
+    return f'Command exited {code}. {operation}: {cause}'
+
+
 def run(args, log, timeout=3600, console=None, env=None, progress=None):
     command = list(map(str, args))
     log.write(f'\n[{now()}] {" ".join(command)}\n')
@@ -505,10 +527,7 @@ def run(args, log, timeout=3600, console=None, env=None, progress=None):
             process.wait()
             raise
     if returncode:
-        lines = [plain(line) for line in output_tail.splitlines() if line.strip()]
-        detail = next((line for line in reversed(lines) if re.search(r'error|failed|denied', line, re.I)
-                       and 'verbose' not in line.lower()), lines[-1] if lines else Path(command[0]).name)
-        raise RuntimeError(f'Command exited {returncode}. {detail}')
+        raise RuntimeError(command_failure(command, returncode, output_tail))
 
 
 def rust_component(binary):
@@ -1070,6 +1089,14 @@ def rotate_logs(limit=5_000_000):
 def save_report(report, scheduled=False, keep=60):
     destination = 'last-check.json' if report['check_only'] else 'last-run.json'
     text = json.dumps(report, indent=2) + '\n'
+    last_scan = STATE / 'last-completed-scan.json'
+    if complete_dependency_scan(report):
+        atomic_write(last_scan, text)
+    elif not last_scan.exists():
+        # Seed from the pre-upgrade state before an interrupted attempt rotates it away.
+        previous_scan, _ = dependency_report_source()
+        if complete_dependency_scan(previous_scan):
+            atomic_write(last_scan, json.dumps(previous_scan, indent=2) + '\n')
     atomic_write(STATE / destination, text)
     if not report['check_only']:
         atomic_write(STATE / ('last-scheduled.json' if scheduled else 'last-manual.json'), text)
@@ -1571,12 +1598,44 @@ def dependency_table(console, rows):
             console.line(f"{plural(count, 'match', 'matches')} · {fixes} with fixes", indent=4)
 
 
+def reopened_reviews(owners):
+    groups = {}
+    for owner in owners:
+        for finding in owner['findings']:
+            review = finding.get('review', {})
+            if review.get('assessment') == 'changed':
+                prior = review.get('previous', {}).get('tool_version')
+                groups.setdefault((label(owner['tool']), owner['version'], prior), []).append(finding)
+    rows = []
+    for (name, version, prior), findings in sorted(groups.items(), key=lambda item: (-len(item[1]), str(item[0]))):
+        versions = f'{prior} → {version}' if prior and prior != version else version
+        detail = [f'Reopened · {name} {versions}', plural(len(findings), 'match', 'matches') + ' to recheck']
+        package_fields = {'dependency_version', 'advisory', 'sources'}
+        comparable = [f['review']['changed_inputs'] for f in findings if 'changed_inputs' in f['review']
+                      and not package_fields.intersection(f['review']['uncompared_inputs'])]
+        same = sum(not package_fields.intersection(fields) for fields in comparable)
+        if same:
+            detail.append(f'{same} with unchanged package version, advisory and sources')
+        for field in ('dependency_version', 'advisory', 'sources', 'coverage', 'platform', 'build'):
+            if field == 'build' and prior != version:
+                continue
+            n = sum(field in f['review'].get('changed_inputs', []) for f in findings)
+            if n:
+                detail.append(f"{audit_reviews.EVIDENCE_LABELS[field]} changed for {n}")
+        if len(comparable) < len(findings):
+            detail.append('previous evidence unavailable for ' + str(len(findings) - len(comparable)))
+        if len(findings) == 1:
+            detail.append(findings[0]['package'])
+        rows.append(' · '.join(detail))
+    return rows
+
+
 def review_overview(report):
     counts = report['review_counts']
     owners = report['owners'].values()
     lines = []
     if report.get('review_error'):
-        lines.append('Local assessments could not be read: ' + report['review_error'])
+        lines.append('Local review history: ' + report['review_error'])
     verified = [f"{label(o['tool'])} {o['update']['version']}" for o in owners
                 if any(f.get('owner_fix') == 'verified' for f in o['findings'])]
     if verified:
@@ -1585,7 +1644,8 @@ def review_overview(report):
         assessment = f['review']['assessment']
         return 'new' if assessment == 'unreviewed' and f.get('new_since_previous') else assessment
 
-    for status, heading in [('changed', 'Reopened after changes'), ('new', 'New since the previous update'),
+    lines.extend(reopened_reviews(owners))
+    for status, heading in [('new', 'New since the previous update'),
                             ('unreviewed', 'Awaiting review'), ('relevant', 'Relevant to this Mac')]:
         groups = []
         for owner in owners:
@@ -1673,6 +1733,18 @@ def dependency_detail(console, owner):
             assessment = review['assessment']
             title = audit_reviews.ASSESSMENTS.get(assessment, 'Reopened' if assessment == 'changed' else 'Awaiting review')
             console.line(title + (' · ' + review['reason'] if review.get('reason') else ''), indent=4)
+            if assessment == 'changed' and 'previous' in review:
+                prior = review['previous']
+                console.line(f"Prior assessment · {audit_reviews.ASSESSMENTS[prior['assessment']]} · {prior['reason']}", indent=4)
+                reasons = []
+                for field in review.get('changed_inputs', []):
+                    if field == 'tool_version':
+                        reasons.append(f"tool {prior['tool_version']} → {owner['version']}")
+                    elif field == 'dependency_version':
+                        reasons.append(f"dependency {prior['dependency_version']} → {f['version']}")
+                    else:
+                        reasons.append(audit_reviews.EVIDENCE_LABELS[field])
+                console.line('Changed · ' + ', '.join(reasons) if reasons else 'Exact reason unavailable from the saved evidence.', indent=4)
             console.line(owner_fix_text(owner, f), indent=4)
             if console.verbose:
                 console.line('Review ID: ' + f['review_token'][:16], indent=4)
@@ -1689,6 +1761,38 @@ def latest_dependency_snapshot():
     return max(reports, key=lambda r: r.get('finished_at', ''))
 
 
+def complete_dependency_scan(run):
+    return run.get('results', {}).get('dependency-audit', {}).get('state') in ('advisories', 'limited', 'clear')
+
+
+def dependency_report_source():
+    latest = latest_dependency_snapshot()
+    if complete_dependency_scan(latest):
+        return latest, None
+    saved = load_report(STATE / 'last-completed-scan.json')
+    if not latest:
+        return saved or {}, None
+    scan = latest.get('results', {}).get('dependency-audit', {})
+    attempt = {'finished_at': latest.get('finished_at'), 'origin': latest.get('origin'),
+               'run_state': latest.get('state'), 'scan_state': scan.get('state', 'not-started')}
+    if scan:
+        attempt['partial_scan'] = scan
+    if saved and complete_dependency_scan(saved) and saved['finished_at'] > latest['finished_at']:
+        return saved, None  # A completed report was published while reading the latest pointers.
+    if saved and complete_dependency_scan(saved) and saved['finished_at'] <= latest['finished_at']:
+        return saved, attempt
+    # Existing installs have no dedicated snapshot until their next completed scan.
+    candidates = [load_report(STATE / name) or {} for name in
+                  ('last-manual.json', 'last-scheduled.json', 'last-run.json', 'last-check.json')]
+    for path in sorted((STATE / 'history').glob('*.json'), reverse=True):
+        archived = load_report(path) or {}
+        if complete_dependency_scan(archived) and archived['finished_at'] <= latest['finished_at']:
+            candidates.append(archived)
+            break
+    eligible = [r for r in candidates if complete_dependency_scan(r) and r['finished_at'] <= latest['finished_at']]
+    return max(eligible, key=lambda r: r['finished_at'], default=latest), attempt
+
+
 def record_review(token, assessment, reason):
     # Serialize read-modify-write with other reviewers and scans.
     with (STATE / 'update.lock').open('a') as lock:
@@ -1696,20 +1800,20 @@ def record_review(token, assessment, reason):
         report = latest_dependency_snapshot().get('results', {}).get('dependency-audit', {})
         if report.get('state') not in ('advisories', 'clear', 'limited'):
             raise ValueError('A completed scan is required to record a review.')
-        matches = [f for o in report['owners'].values() for f in o['findings']
+        matches = [(o, f) for o in report['owners'].values() for f in o['findings']
                    if re.fullmatch(r'[0-9a-f]{12,64}', token) and f.get('review_token', '').startswith(token)]
         if len(matches) != 1:
             raise ValueError('This review ID does not uniquely match the latest scan. Check --verbose.')
-        f = matches[0]
+        owner, f = matches[0]
         path = STATE / audit_reviews.REVIEW_FILE
         entries = audit_reviews.load(path)
-        entries[f['review_token']] = audit_reviews.entry(f, assessment, reason, now())
+        entries[f['review_token']] = audit_reviews.entry(f, assessment, reason, now(), owner=owner)
         atomic_write(path, json.dumps({'version': 1, 'entries': entries}, indent=2) + '\n')
     return f['id']
 
 
 def show_dependencies(console, tool=None):
-    saved = latest_dependency_snapshot()
+    saved, attempt = dependency_report_source()
     report = saved.get('results', {}).get('dependency-audit') or {'state': 'not-run-yet'}
     if 'review_counts' in report:
         audit_reviews.apply_local(report, STATE / audit_reviews.REVIEW_FILE)
@@ -1728,10 +1832,14 @@ def show_dependencies(console, tool=None):
             return 2
         selected = owners[keys[0]]
     if console.json_output:
-        console.say(json.dumps(selected if selected is not None else report, indent=2), force=True)
-        return 0
+        output = selected if selected is not None else report
+        if attempt:
+            output = dict(output, latest_attempt=attempt, last_completed_at=report.get('checked_at') if complete_dependency_scan(saved) else None,
+                          last_completed_run_at=saved.get('finished_at') if complete_dependency_scan(saved) else None)
+        console.say(json.dumps(output, indent=2), force=True)
+        return int(bool(attempt))
     title = 'Dependency audit'
-    stamp = saved.get('finished_at')
+    stamp = report.get('checked_at') or saved.get('finished_at')
     date = datetime.fromisoformat(stamp).astimezone().strftime('%b %d, %Y at %I:%M %p %Z').replace(' 0', ' ') if stamp else ''
     if date and len(title) + len(date) + 3 <= console.columns:
         console.say(console.paint(title, '1') + '   ' + console.paint(date, '2'))
@@ -1739,13 +1847,27 @@ def show_dependencies(console, tool=None):
         console.line(title, color='1')
         if date:
             console.line(date, color='2')
+    if attempt:
+        when = datetime.fromisoformat(attempt['finished_at']).astimezone().strftime('%b %d at %I:%M %p %Z')
+        origin = {'manual': 'manual update', 'scheduled': 'scheduled update', 'preview': 'preview'}.get(attempt['origin'], 'run')
+        reason = ('stopped before the dependency scan' if attempt['scan_state'] == 'not-started' else
+                  'did not finish the dependency scan')
+        console.line(f'The {origin} on {when} {reason}.', color='33')
+        if complete_dependency_scan(saved):
+            console.line(f'Showing the last completed scan from {date}.' if report.get('checked_at') else
+                         f'Showing the last completed scan from the run that finished {date}.')
+            partial = attempt.get('partial_scan', {})
+            if partial.get('error'):
+                console.line(plain(partial['error']), color='33')
+            if partial.get('match_count'):
+                console.line(f"The incomplete scan also recorded {plural(partial['match_count'], 'match', 'matches')}. See --json for its findings.")
     if report['state'] == 'not-run-yet':
-        console.line('No recorded dependency scan. Run mise run maintenance:update.')
-        return 0
+        console.line('No recorded dependency scan. Run mise run maintenance:check.')
+        return int(bool(attempt))
     incomplete = report['state'] in ('failed', 'interrupted')
     if incomplete:
         console.section('Scan incomplete', [report.get('error') or 'The scan stopped early.',
-                        'Retry with mise run maintenance:update.'], '1;31')
+                        'Retry with mise run maintenance:check.'], '1;31')
     if selected is not None:
         dependency_detail(console, selected)
         if selected['findings']:
@@ -1753,11 +1875,11 @@ def show_dependencies(console, tool=None):
             console.line('Dependency fixes arrive with a release of ' + label(selected['tool']) + '.')
             if not console.verbose:
                 console.line('Add --verbose for evidence paths and advisory links.', color='2')
-        return 0
+        return int(bool(attempt))
     if not owners:
         if not incomplete:
             console.line('No active tools were recorded for this scan.')
-        return 0
+        return int(bool(attempt))
 
     rows = affected_tools(owners.values())
     checked = sum(bool(o['package_count']) for o in owners.values())
@@ -1801,7 +1923,7 @@ def show_dependencies(console, tool=None):
     if console.verbose:
         for owner, *_ in rows:
             dependency_detail(console, owner)
-    return 0
+    return int(bool(attempt))
 
 
 def show_history(console, limit):
@@ -1922,6 +2044,8 @@ def main(argv=None):
                     output_start = log.tell()
                     try:
                         result = action() or {'state': 'checked' if args.check else 'success'}
+                        if name == 'dependency-audit' and result['state'] in ('advisories', 'clear', 'limited'):
+                            result['checked_at'] = now()
                         if result['state'] == 'failed':
                             report['errors'].append(name)
                             log.write(f"[{now()}] {name}: {result['error']}\n")
@@ -1993,7 +2117,7 @@ def main(argv=None):
                 step('mise', lambda: command([MISE, 'version', '--json'], log))
             step('tools', lambda: command([MISE, 'outdated', '--global', '--json'] if args.check else [MISE, 'upgrade', '--global', '-y'], log))
             step('audit', lambda: audit_tools(log, console))
-            step('dependency-audit', lambda: dependency_audit.scan(MISE, HOME, ENV, log))
+            step('dependency-audit', lambda: dependency_audit.scan(MISE, HOME, ENV, log, persist_reviews=atomic_write))
             if 'rust' in tomllib.loads(CONFIG.read_text()).get('tools', {}):
                 step('rustup', lambda: command([HOME / '.cargo/bin/rustup', 'check'] if args.check else [HOME / '.cargo/bin/rustup', 'self', 'update'], log, timeout=600))
 

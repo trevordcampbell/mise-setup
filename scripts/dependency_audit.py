@@ -225,7 +225,7 @@ def scanner_rows(scanner, scratch, paths, env, log, errors):
     return rows
 
 
-def scan(mise, home, env, log):
+def scan(mise, home, env, log, *, persist_reviews=None):
     def mise_output(*args):
         proc = subprocess.run([mise, '-C', home, *args], cwd=home, env=env, text=True, capture_output=True, timeout=30)
         if proc.returncode:
@@ -306,7 +306,7 @@ def scan(mise, home, env, log):
     report = {'state': state, 'owners': owners, 'match_count': count}
     if errors:
         report.update(state='failed', error=' / '.join(errors))
-    audit_reviews.apply_local(report, home / '.local/state/mise/maintenance' / audit_reviews.REVIEW_FILE)
+    audit_reviews.apply_local(report, home / '.local/state/mise/maintenance' / audit_reviews.REVIEW_FILE, persist=persist_reviews)
     return report
 
 

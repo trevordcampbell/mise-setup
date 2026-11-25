@@ -93,6 +93,7 @@ class ReviewTests(unittest.TestCase):
             path.write_text(json.dumps({'finished_at':'2026-11-24','results':{'dependency-audit':scan}}))
             self.assertEqual(maintenance.record_review(token,'relevant','Observed caller'),f['id'])
             entries=audit_reviews.load(root/audit_reviews.REVIEW_FILE)
+            self.assertEqual(entries[f['review_token']]['evidence']['tool_version'], o['version'])
             audit_reviews.apply(scan,entries)
             self.assertEqual(scan['review_counts'],{'relevant':1})
             self.assertEqual((root/audit_reviews.REVIEW_FILE).stat().st_mode & 0o777,0o600)
@@ -101,6 +102,47 @@ class ReviewTests(unittest.TestCase):
             (root/'last-check.json').write_text(json.dumps({'finished_at':'2026-11-25','results':{'dependency-audit':{'state':'failed'}}}))
             with self.assertRaises(ValueError):
                 maintenance.record_review(token,'outside','invalid scan')
+
+    def test_reopened_finding_explains_changed_inputs_using_the_reviewed_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build = root / 'install'
+            build.mkdir()
+            old = owner()
+            audit_reviews.sign_findings(old, build)
+            previous = old['findings'][0]
+            token = previous['review_token']
+            entries = {token: audit_reviews.entry(previous, 'outside', 'Scoped review', 'yesterday')}
+            path = root / audit_reviews.REVIEW_FILE
+            path.write_text(json.dumps({'version': 1, 'entries': entries}))
+            current = copy.deepcopy(old)
+            current['version'] = '2.0.0'
+            finding = current['findings'][0]
+            finding['version'] = '8.0.0'
+            finding['record_hashes'] = ['updated']
+            audit_reviews.sign_findings(current, build)
+            report = {'owners': {'current': current}}
+            audit_reviews.apply_local(report, path)
+            self.assertNotIn('changed_inputs', finding['review'])
+            self.assertEqual(finding['review']['previous']['assessment'], 'outside')
+            # A same-key snapshot with a different token cannot stand in for the review.
+            history = root / 'history'
+            history.mkdir()
+            (history / 'new.json').write_text(json.dumps({'results': {'dependency-audit': report}}))
+            del old['review_target']  # Older reports did not record the platform.
+            archive = history / 'old.json'
+            archive.write_text(json.dumps({'results': {'dependency-audit': {'owners': {'old': old}}}}))
+            audit_reviews.apply_local(report, path)
+            review = finding['review']
+            self.assertEqual(review['changed_inputs'], ['tool_version', 'dependency_version', 'advisory'])
+            self.assertEqual(review['uncompared_inputs'], ['platform'])
+            self.assertEqual(review['previous']['reason'], 'Scoped review')
+            self.assertNotIn('evidence', audit_reviews.load(path)[token])
+            audit_reviews.apply_local(report, path, persist=maintenance.atomic_write)
+            archive.unlink()
+            audit_reviews.apply_local(report, path)
+            self.assertEqual(finding['review'], review)
+            self.assertEqual(report['review_counts'], {'changed': 1})
 
     def test_summary_highlights_verified_fixes_and_reopened_reviews(self):
         o=owner(); f=o['findings'][0]; f.update(owner_fix='verified',replacement_versions=['7.4.0'],review={'assessment':'changed'})

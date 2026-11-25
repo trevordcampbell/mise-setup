@@ -758,6 +758,19 @@ class MaintenanceOutputTests(unittest.TestCase):
         self.assertIn('failure detail', log.getvalue())
         self.assertIn('failure detail', self.stderr.getvalue())
 
+    def test_mise_error_cause_survives_version_and_help_footers(self):
+        footer = 'mise ERROR Version: 2026.11.12 macos-arm64 (2026-11-21)\nmise ERROR Run with --verbose or MISE_VERBOSE=1 for more information'
+        cause = 'Failed to install aqua:openai/codex@latest: connection reset'
+        output = f'mise ERROR {cause}\ninstallation failed; previous lockfiles were preserved\n{footer}'
+        self.assertIn(cause, maintenance.command_failure(['mise', 'upgrade', '--global'], 1, output))
+        separate = 'mise ERROR Failed to install codex\nmise ERROR connection reset\n' + footer
+        self.assertIn('Failed to install codex · connection reset', maintenance.command_failure(['mise', 'upgrade'], 1, separate))
+        chain = 'mise ERROR error decoding response body\nmise ERROR connection reset\n' + footer
+        self.assertEqual(maintenance.command_failure(['mise', 'self-update'], 1, chain),
+                         'Command exited 1. mise self-update: connection reset')
+        self.assertIn('No diagnostic output', maintenance.command_failure(['mise'], 1, footer))
+        self.assertIn('invalid --verbose option', maintenance.command_failure(['other'], 2, 'error: invalid --verbose option'))
+
     def test_verbose_json_keeps_command_output_off_stdout(self):
         with redirect_stdout(self.stdout), redirect_stderr(self.stderr):
             console = maintenance.Console(verbose=True, json_output=True)
@@ -873,6 +886,50 @@ class DependencyReportTests(unittest.TestCase):
         self.assertIn('No advisory matches in the packages checked', self.render()[1])
         self.saved['results'] = {}
         self.assertIn('No recorded dependency scan', self.render()[1])
+
+    def test_interrupted_check_keeps_completed_scan_and_blocks_stale_reviews(self):
+        self.saved.update(started_at=self.saved['finished_at'], state='success', origin='manual', check_only=False)
+        self.report['checked_at'] = self.saved['finished_at']
+        maintenance.save_report(self.saved)
+        latest = {'started_at': '2026-11-25T11:00:00+00:00', 'finished_at': '2026-11-25T11:05:00+00:00',
+                  'origin': 'preview', 'state': 'interrupted', 'check_only': True, 'results': {}}
+        maintenance.save_report(latest)
+        for args in ([], ['--tool', 'python'], ['--json'], ['--tool', 'python', '--json']):
+            rc, text, _ = self.render(*args)
+            self.assertEqual(rc, 1)
+            if '--json' in args:
+                data = json.loads(text)
+                self.assertEqual(data['latest_attempt']['scan_state'], 'not-started')
+                self.assertEqual(data['last_completed_at'], self.report['checked_at'])
+            else:
+                self.assertIn('stopped before the dependency scan', text)
+                self.assertIn('last completed scan', text)
+                self.assertNotIn('No recorded dependency scan', text)
+        with self.assertRaisesRegex(ValueError, 'completed scan'):
+            maintenance.record_review('a' * 16, 'notice', 'test')
+        latest['results']['dependency-audit'] = {'state': 'failed', 'error': 'Scanner offline', 'match_count': 1}
+        maintenance.save_report(latest)
+        rc, text, _ = self.render('--json')
+        self.assertEqual(rc, 1)
+        self.assertEqual(json.loads(text)['latest_attempt']['partial_scan']['error'], 'Scanner offline')
+        self.assertEqual(json.loads(text)['match_count'], 3)
+
+    def test_interrupted_reports_can_recover_a_preexisting_scan_from_history(self):
+        archive = self.state / 'history'
+        archive.mkdir()
+        (archive / 'old.json').write_text(json.dumps(self.saved))
+        self.saved = {'finished_at': '2026-11-25T11:05:00+00:00', 'state': 'interrupted', 'results': {}}
+        rc, text, _ = self.render('--json')
+        recovered = json.loads(text)
+        self.assertEqual((rc, recovered['match_count']), (1, 3))
+        self.assertIsNone(recovered['last_completed_at'])
+        self.assertEqual(recovered['last_completed_run_at'], '2026-11-24T21:00:00+00:00')
+        self.saved.update(started_at=self.saved['finished_at'], check_only=True, origin='preview')
+        maintenance.save_report(self.saved)
+        (archive / 'old.json').unlink()
+        self.assertEqual(json.loads(self.render('--json')[1])['match_count'], 3)
+        (self.state / 'last-completed-scan.json').unlink()
+        self.assertEqual(json.loads(self.render('--json')[1])['state'], 'not-run-yet')
 
     def test_compare_matches_ignores_owner_upgrades_and_handles_lost_coverage(self):
         old = json.loads(json.dumps(self.saved))
