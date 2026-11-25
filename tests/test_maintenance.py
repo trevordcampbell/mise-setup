@@ -1304,6 +1304,48 @@ class SyncHealthHistoryTests(unittest.TestCase):
         self.assertEqual(maintenance.cask_result('skipped: installed app is current, newer, or incomparable', True)['state'], 'availability-unknown')
         self.assertEqual(maintenance.cask_result('unrecognized output', True)['state'], 'availability-unknown')
 
+    def test_cask_upgrade_confirmation_survives_replacement_notice(self):
+        key = 'brew-cask:sample'
+        notice = 'brew-cask: replacing /Applications/Sample (Beta).app — macOS may revoke Privacy & Security permissions for this app'
+        output = (f'hdiutil: WARNING: detach is deprecated\nmise WARN  {notice}\n'
+                  'mise brew-cask:sample ✓ 2.0\nmise brew-cask: upgraded sample 1.0,abc -> 2.0,def\n')
+        def command(args, log, **kwargs):
+            log.write(output if 'upgrade' in args else '1 package(s) already installed\n')
+        with patch.object(maintenance, 'cask_apps', return_value=[]):
+            result = maintenance.native_cask_update(key, False, io.StringIO(), command)
+            preview = maintenance.native_cask_update(key, True, io.StringIO(), command)
+        self.assertEqual(result, {'state': 'updated', 'native_upgrade': {'before': '1.0,abc', 'after': '2.0,def'}})
+        self.assertNotIn('native_upgrade', preview)
+        for text in (f'mise WARN  {notice}', output.replace('upgraded sample ', 'upgraded other '),
+                     output + 'mise WARN  unable to verify eligible version\n',
+                     output + 'mise brew-cask:sample: skipped: incompatible version\n'):
+            with self.subTest(text=text):
+                self.assertEqual(maintenance.cask_result(text, False, applied_cask='sample')['state'], 'availability-unknown')
+
+    def test_saved_cask_report_resolves_only_matching_verified_changes(self):
+        path = '/Applications/Sample.app'
+        notice = f'brew-cask: replacing {path} — macOS may revoke Privacy & Security permissions for this app'
+        change = {'id': path, 'name': 'Sample', 'kind': 'version', 'action': 'updated', 'before': '1', 'after': '2'}
+        old = {'state': 'availability-unknown', 'notes': [maintenance.NATIVE_AVAILABILITY_NOTE, notice],
+               'changes': [change]}
+        key = 'brew-cask:sample'
+        report = {'schema_version': 4, 'state': 'success', 'changes': [change], 'results': {key: old}}
+        maintenance.atomic_write(maintenance.STATE / 'last-run.json', json.dumps(report))
+        with redirect_stdout(self.fixture.stdout):
+            self.assertEqual(maintenance.main(['--status', '--json']), 0)
+        corrected = json.loads(self.fixture.stdout.getvalue())['results'][key]
+        self.assertEqual((corrected['state'], corrected['notes']), ('updated', [notice]))
+        self.assertEqual(maintenance.load_report(maintenance.STATE / 'last-run.json'), report)
+        for override in ({'changes': []}, {'changes': [dict(change, id='/Applications/Other.app')]},
+                         {'notes': [*old['notes'], 'unknown version']}, {'vendor_check': {'state': 'unverified'}},
+                         {'observation_errors': ['incomplete']}, {'plan_unverified': True}, {'state': 'failed'}):
+            result = dict(old, **override)
+            maintenance.restore_cask_outcomes(dict(report, results={key: result}))
+            self.assertEqual(result['state'], override.get('state', 'availability-unknown'))
+        for fields in ({'check_only': True}, {'schema_version': 5}):
+            maintenance.restore_cask_outcomes(dict(report, **fields))
+            self.assertEqual(old['state'], 'availability-unknown')
+
     def test_running_app_preview_never_applies_and_tracks_repeated_deferrals(self):
         def command(args, log, **kwargs):
             if 'google-chrome' in ' '.join(map(str, args)):

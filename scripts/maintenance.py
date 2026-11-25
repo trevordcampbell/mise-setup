@@ -132,6 +132,8 @@ def outcome(result):
         return '!', 'Update preview incomplete', '33'
     if result.get('observation_errors'):
         return '!', 'Completed; change verification unavailable', '33'
+    if state == 'updated':
+        return '✓', 'Mise reported a native upgrade', '32'
     if state == 'update-available':
         return '↑', f"Update available: {result.get('installed', '?')} → {result.get('available', '?')}", '33'
     vendor = result.get('vendor_check', {})
@@ -256,6 +258,7 @@ class Console:
                     self.finished(name, result)
         results = report.get('results', {})
         failures, security, waiting, limits, notes, available = [], [], [], [], [], []
+        replaced_apps = []
         plans = report.get('planned_changes', [])
         preview = report.get('check_only', False)
         for name, result in results.items():
@@ -285,8 +288,11 @@ class Console:
             limits.extend(result.get('plan_issues', []))
             for note in messages:
                 if note in ('installed app is running and updates itself', 'installed app is current, newer, or incomparable',
-                            'Native check could not prove an eligible update; see the detailed log.') or (
+                            NATIVE_AVAILABILITY_NOTE) or (
                             note.startswith('Official vendor check unavailable:') and vendor.get('error')):
+                    continue
+                if not self.verbose and replacement_app(note):
+                    replaced_apps.append(title)
                     continue
                 hold = re.fullmatch(r'newer (.+?) release (\S+) \(released .+?, eligible (.+?)\) ignored by minimum_release_age .*', note)
                 if hold:
@@ -316,7 +322,6 @@ class Console:
         owners = dependencies.get('owners', {}).values()
         affected = [owner for owner in owners if owner.get('findings')]
         coverage = dependency_coverage(owners)
-        limits.extend(f"{reason}: {', '.join(names)}." for reason, names in coverage.items())
         elapsed = report.get('elapsed_seconds')
         if elapsed is None and report.get('finished_at') and report.get('started_at'):
             elapsed = (datetime.fromisoformat(report['finished_at']) - datetime.fromisoformat(report['started_at'])).total_seconds()
@@ -326,7 +331,7 @@ class Console:
             title, color = title + ' interrupted', '31'
         elif failures or report['state'] == 'failed':
             title, color = title + ' finished with errors', '31'
-        elif security or affected or limits or waiting:
+        elif security or affected or limits or coverage or waiting:
             title, color = title + ' complete', '36'
         else:
             title, color = title + ' complete', '32'
@@ -363,6 +368,11 @@ class Console:
         self.section(heading + (' (partial results)' if failures else ''), changed_rows(changes), '32')
         self.section('Changed before this run', changed_rows(report.get('since_previous_run', [])), '1')
         self.section('Check coverage', limits, '33')
+        self.section('Dependency audit coverage', [f"{reason}: {', '.join(names)}." for reason, names in coverage.items()], '33')
+        if replaced_apps:
+            apps = list(dict.fromkeys(replaced_apps))
+            names = ' and '.join(filter(None, [', '.join(apps[:-1]), apps[-1]]))
+            notes.append(f"macOS may ask you to grant permissions again for {names}.")
         self.section('Other notes', notes, '2')
         if failures or self.verbose:
             self.say(self.paint(f"Log  {report.get('log', str(LOG))}", '2'))
@@ -1082,18 +1092,31 @@ def background_changes(previous, before, errors):
     return compare(old, before)
 
 
-def cask_result(text, running):
+NATIVE_AVAILABILITY_NOTE = 'Native check could not prove an eligible update; see the detailed log.'
+
+
+def replacement_app(note):
+    match = re.match(r'brew-cask: replacing (/.+?\.app) — macOS may revoke Privacy & Security permissions for this app\b', note)
+    return match[1] if match else None
+
+
+def cask_result(text, running, *, applied_cask=None):
     """Use native platform/version checks; do not guess cask metadata versions."""
     if running and re.search(r'install cask [^/\s]+/[^\s]+', text):
         return {'state': 'deferred-running-app', 'availability': 'confirmed'}
     if 'running and updates itself' in text:
         return {'state': 'self-updating'}
+    if applied_cask and 'skipped:' not in text:
+        upgrade = re.search(rf'(?m)^(?:mise )?brew-cask: upgraded {re.escape(applied_cask)} (\S+) -> (\S+)[ \t]*$', text)
+        warnings = re.findall(r'(?m)\bWARN[ \t]+([^\r\n]+)', text)
+        if upgrade and all(replacement_app(note) for note in warnings):
+            return {'state': 'updated', 'native_upgrade': {'before': upgrade[1], 'after': upgrade[2]}}
     if 'skipped:' in text or 'WARN' in text:
-        return {'state': 'availability-unknown', 'notes': ['Native check could not prove an eligible update; see the detailed log.']}
+        return {'state': 'availability-unknown', 'notes': [NATIVE_AVAILABILITY_NOTE]}
     if 'already up to date' in text or 'already installed' in text:
         return {'state': 'current'}
     if running:
-        return {'state': 'availability-unknown', 'notes': ['Native check could not prove an eligible update; see the detailed log.']}
+        return {'state': 'availability-unknown', 'notes': [NATIVE_AVAILABILITY_NOTE]}
     return {'state': 'success'}
 
 
@@ -1329,7 +1352,25 @@ def native_cask_update(key, check, log, command):
     command([MISE, 'bootstrap', 'packages', 'upgrade', key, '-y'], log,
             timeout=1800, progress=CaskDownloadProgress(key))
     log.flush(); log.seek(start); text = log.read(); log.seek(0, 2)
-    return cask_result(text, False)
+    return cask_result(text, False, applied_cask=key.removeprefix('brew-cask:'))
+
+
+def restore_cask_outcomes(report):
+    """Interpret older saved runs with a verified bundle change and only replacement notices."""
+    if report.get('schema_version', 0) >= 5 or report.get('check_only'):
+        return
+    for key, result in report.get('results', {}).items():
+        if not key.startswith('brew-cask:') or result['state'] != 'availability-unknown' or result.get('vendor_check'):
+            continue
+        messages = result.get('notes', [])
+        if (NATIVE_AVAILABILITY_NOTE not in messages or result.get('observation_errors')
+                or result.get('plans') or result.get('plan_unverified')):
+            continue
+        changed = {c['id'] for c in result.get('changes', []) if c.get('id') and c.get('kind') == 'version'
+                   and c.get('action') == 'updated' and c.get('before') and c.get('after') and c['before'] != c['after']}
+        notices = [note for note in messages if note != NATIVE_AVAILABILITY_NOTE]
+        if notices and all(replacement_app(note) in changed for note in notices):
+            result.update(state='updated', notes=notices)
 
 
 def doctor_health():
@@ -1829,6 +1870,7 @@ def main(argv=None):
         return 0
     if args.status:
         saved = load_report(STATE / 'last-run.json') or {'state': 'not-run-yet'}
+        restore_cask_outcomes(saved)
         deps = saved.get('results', {}).get('dependency-audit', {})
         if 'review_counts' in deps:
             audit_reviews.apply_local(deps, STATE / audit_reviews.REVIEW_FILE)
@@ -1844,7 +1886,7 @@ def main(argv=None):
         LOG.parent.mkdir(parents=True, exist_ok=True)
         rotate_logs()
         started = time.monotonic()
-        report = {'started_at': now(), 'check_only': args.check, 'results': {}, 'errors': [], 'log': str(LOG), 'schema_version': 4, 'origin': 'preview' if args.check else 'scheduled' if args.scheduled else 'manual'}
+        report = {'started_at': now(), 'check_only': args.check, 'results': {}, 'errors': [], 'log': str(LOG), 'schema_version': 5, 'origin': 'preview' if args.check else 'scheduled' if args.scheduled else 'manual'}
         previous = load_report(STATE / 'last-run.json')
         report['inventory_before'], report['inventory_errors_before'] = inventory()
         report['since_previous_run'] = background_changes(previous, report['inventory_before'], report['inventory_errors_before'])
