@@ -92,6 +92,7 @@ def label(name):
         'font-poppins': 'Poppins fonts', 'node': 'Node.js', 'python': 'Python',
         'gh': 'GitHub CLI', 'cargo:zpl_toolchain_cli': 'ZPL toolchain',
         'brew-cask:claude': 'Claude Desktop', 'claude': 'Claude Code', 'audit': 'Security audit', 'dependency-audit': 'Tool dependencies', 'osv-scanner': 'OSV-Scanner',
+        'brew-cask:antigravity': 'Antigravity Desktop', 'agy': 'Antigravity CLI',
         'github:skw398/scap': 'Scap', 'uv': 'uv', 'pnpm': 'pnpm',
     }
     short = name.removeprefix('brew-cask:').removeprefix('brew:')

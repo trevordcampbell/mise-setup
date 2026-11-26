@@ -18,6 +18,8 @@ minimum_release_age = "24h"
 UV_PYTHON_PREFERENCE = "system"
 # Let Mise update Claude Code instead of running a second background updater.
 DISABLE_AUTOUPDATER = "1"
+# Keep Antigravity CLI releases on the same Mise update schedule as other global tools.
+AGY_CLI_DISABLE_AUTO_UPDATE = "true"
 
 [tools]
 node = { version = "latest", postinstall = 'sh "$HOME/.config/mise/scripts/update-bundled-manager.sh" node "$MISE_TOOL_INSTALL_PATH"' }
@@ -32,6 +34,7 @@ gh = "latest"
 uv = "latest"
 claude = "latest"
 codex = "latest"
+agy = "latest"
 osv-scanner = "latest"
 
 [bootstrap.packages]
@@ -64,6 +67,7 @@ osv-scanner = "latest"
 "brew-cask:ledger-wallet" = { version = "latest", adopt = true }
 "brew-cask:chatgpt" = { version = "latest", adopt = true }
 "brew-cask:claude" = { version = "latest", adopt = true }
+"brew-cask:antigravity" = { version = "latest", adopt = true }
 "brew-cask:t3-code" = { version = "latest", adopt = true }
 "brew-cask:blender" = "latest"
 "brew-cask:font-poppins" = { version = "latest", adopt = true }
