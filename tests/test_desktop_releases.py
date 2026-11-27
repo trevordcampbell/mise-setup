@@ -47,8 +47,41 @@ class DesktopReleaseTests(unittest.TestCase):
                     self.resolve(name, data.replace(b'arm64', b'x64'))
         targets = ['https://github.com/crystalidea/macs-fan-control/releases/download/v1.5.23/macsfancontrol.zip',
                    'https://release-assets.githubusercontent.com/signed-asset']
-        with patch.object(releases, 'first_redirect', side_effect=targets):
+        with patch.object(releases, 'first_redirect', side_effect=targets), patch.object(releases, 'published_zip', return_value={}):
             self.assertEqual(releases.github_release('macs-fan-control', 'arm64')['version'], '1.5.23')
+
+    def test_github_zip_is_pinned_to_exact_published_tag_and_filename(self):
+        url = 'https://github.com/desktop/desktop/releases/download/release-3.1/GitHub.Desktop-arm64.zip'
+        asset = {'name': 'GitHub.Desktop-arm64.zip', 'browser_download_url': url, 'digest': 'sha256:' + '9' * 64}
+        data = {'tag_name': 'release-3.1', 'draft': False, 'prerelease': False, 'assets': [asset]}
+        def match(response):
+            with patch.object(releases, 'github_json', return_value=response):
+                return releases.published_zip('desktop/desktop', 'release-3.1', asset['name'])
+        self.assertEqual(match(data)['artifact']['url'], url)
+        for changed in [{'tag_name': 'release-3.0'}, {'prerelease': True}, {'assets': [asset, asset]},
+                        {'assets': [dict(asset, browser_download_url=url + '.sig')]}]:
+            self.assertEqual(match(dict(data, **changed)), {})
+
+    def test_sparkle_signature_belongs_to_one_full_unrestricted_archive(self):
+        item = ET.Element('item')
+        attrs = {'url': 'https://example.org/file.zip', 'length': '32', releases.S + 'edSignature': 'A' * 86 + '=='}
+        enc = ET.SubElement(item, 'enclosure', attrs)
+        self.assertEqual(releases.sparkle_asset(item, enc)['artifact']['size'], 32)
+        for change in [{releases.S + 'deltaFrom': '123'}, {releases.S + 'installationType': 'guided-package'},
+                       {'length': '-1'}, {releases.S + 'edSignature': ''}]:
+            self.assertEqual(releases.sparkle_asset(item, ET.Element('enclosure', dict(attrs, **change))), {})
+        ET.SubElement(item, releases.S + 'phasedRolloutInterval').text = '86400'
+        self.assertEqual(releases.sparkle_asset(item, enc), {})
+
+    def test_opera_sidecar_digest_is_for_the_selected_installer(self):
+        source = 'https://ftp.opera.com/pub/opera/desktop/'
+        name = 'Opera_1.2.3.4_Setup.dmg'
+        mac = source + '1.2.3.4/mac/'
+        files = {source: b'href="1.2.3.4/"', mac: f'href="{name}" href="{name}.sha256sum"'.encode()}
+        for suffix, valid in [('', True), ('  ' + name, True), ('  another.dmg', False)]:
+            files[mac + name + '.sha256sum'] = ('c' * 64 + suffix).encode()
+            with patch.object(releases, 'fetch', side_effect=files.__getitem__):
+                self.assertEqual('artifact' in releases.opera_release(), valid)
 
     def test_discord_postman_and_ledger_stable_macos_releases(self):
         discord = {'full': {'host_version': [0, 0, 424],
@@ -85,7 +118,7 @@ class DesktopReleaseTests(unittest.TestCase):
         for name, url, version in [
                 ('github', 'https://desktop.githubusercontent.com/releases/3.7.1-abcdef/GitHubDesktop-arm64.zip', '3.7.1'),
                 ('slack', 'https://downloads.slack-edge.com/desktop-releases/mac/arm64/4.53.292/Slack-4.53.292-macOS.dmg', '4.53.292')]:
-            with patch.object(releases, 'urlopen') as fetch:
+            with patch.object(releases, 'urlopen') as fetch, patch.object(releases, 'published_zip', return_value={}):
                 response = fetch.return_value.__enter__.return_value
                 response.geturl.return_value = url
                 self.assertEqual(releases.redirected_release(name, 'arm64')['version'], version)

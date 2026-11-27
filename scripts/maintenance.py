@@ -1167,7 +1167,14 @@ def cask_result(text, running, *, applied_cask=None):
         if upgrade and all(replacement_app(w[1]) or (w.start() < upgrade.start() and retry_notice(w[1])) for w in warnings):
             return {'state': 'updated', 'native_upgrade': {'before': upgrade[1], 'after': upgrade[2]}}
     if 'skipped:' in text or 'WARN' in text:
-        return {'state': 'availability-unknown', 'notes': [NATIVE_AVAILABILITY_NOTE]}
+        unknown = {'state': 'availability-unknown', 'notes': [NATIVE_AVAILABILITY_NOTE]}
+        if applied_cask and 'WARN' not in text:
+            skips = [line.strip() for line in text.splitlines() if 'skipped:' in line]
+            pattern = (rf'(?:mise )?brew-cask:{re.escape(applied_cask)}(?::| ✓) skipped: '
+                       r'installed app is current, newer, or incomparable')
+            if skips and all(re.fullmatch(pattern, line) for line in skips):
+                unknown['native_version_skip'] = True
+        return unknown
     if 'already up to date' in text or 'already installed' in text:
         return {'state': 'current'}
     if running:
@@ -1242,7 +1249,8 @@ def vendor_release(key):
         numeric_version(version)
         if not re.fullmatch(r'https://downloads\.cursor\.com/production/[0-9a-f]{40}/darwin/' + arch + r'/Cursor-darwin-' + arch + r'\.zip', data['url']):
             raise ValueError('Unexpected Cursor stable artifact')
-        return desktop_releases.release(source, version, **desktop_releases.checksum_asset(data['url'], data.get('sha256hash')))
+        artifact = desktop_releases.checksum_asset(data['url'], data.get('sha256hash')) or desktop_releases.signed_image(data['url'][:-4] + '.dmg')
+        return desktop_releases.release(source, version, **artifact)
     if key == 'brew-cask:google-chrome':
         # A partial Chrome rollout is not the release the stable DMG serves.
         source = 'https://versionhistory.googleapis.com/v1/chrome/platforms/mac/channels/stable/versions/all/releases?filter=endtime%3Dnone,fraction%3D1'
@@ -1253,7 +1261,8 @@ def vendor_release(key):
                     if r.get('fraction') == 1 and not r.get('serving', {}).get('endTime')]
         if not versions:
             raise ValueError('Google returned no fully rolled-out macOS stable release')
-        return {'version': max(versions, key=numeric_version), 'source': source, 'channel': 'stable (fully rolled out)'}
+        return {'version': max(versions, key=numeric_version), 'source': source, 'channel': 'stable (fully rolled out)',
+                **desktop_releases.signed_image('https://dl.google.com/chrome/mac/universal/stable/GGRO/googlechrome.dmg')}
     if key == 'brew-cask:chatgpt':
         suffix = '' if arm else '-x64'
         source = f'https://persistent.oaistatic.com/codex-app-prod/appcast{suffix}.xml'
@@ -1282,7 +1291,10 @@ def vendor_release(key):
             arch = 'arm64' if arm else 'x64'
             if enclosure.get('url') != f'https://persistent.oaistatic.com/codex-app-prod/ChatGPT-darwin-{arch}-{version}.zip':
                 raise ValueError('Unexpected ChatGPT stable artifact')
-            releases.append({'version': version, 'build': build, 'source': source, 'channel': 'stable'})
+            maximum = item.findtext(SPARKLE + 'maximumSystemVersion')
+            if maximum and compare_numeric_versions('.'.join(map(str, os_version)), maximum, pad=True) > 0:
+                continue
+            releases.append(desktop_releases.release(source, version, build=build, **desktop_releases.sparkle_asset(item, enclosure)))
         if not releases:
             raise ValueError('No compatible stable ChatGPT release in official feed')
         return max(releases, key=lambda r: numeric_version(r['build']))
@@ -1340,6 +1352,10 @@ def orbstack_assessment(app):
             'exit_code': result.returncode, 'message': plain(result.stdout), 'checked_at': now()}
 
 
+def native_allows_vendor_update(result):
+    return result['state'] in ('current', 'updated') or result.get('native_version_skip') is True
+
+
 def orbstack_update(key, check, log, command):
     app = APPLICATIONS / 'OrbStack.app'
 
@@ -1354,8 +1370,28 @@ def orbstack_update(key, check, log, command):
     if app.exists():
         vendor = assess()
         if vendor['state'] == 'update-available' and not check and not is_running(app):
-            native_cask_update(key, False, log, command)
+            native = native_cask_update(key, False, log, command)
             vendor = assess()
+            receipts = PREFIX / 'Caskroom/orbstack'
+            if (vendor['state'] == 'update-available' and native_allows_vendor_update(native)
+                    and (owner := vendor_install.ownership(receipts, app)) and not is_running(app)):
+                cli = app / 'Contents/MacOS/bin/orbctl'
+                engine = subprocess.run([str(cli), 'status'], cwd=HOME, env=ENV, stdin=subprocess.DEVNULL,
+                                        capture_output=True, text=True, timeout=30)
+                if (engine.returncode, engine.stdout.strip().lower()) in ((0, 'running'), (2, 'starting')):
+                    return {'state': 'deferred-running-app', 'vendor_check': vendor, 'availability': 'confirmed',
+                            'notes': ['OrbStack will update when its engine is stopped.']}
+                if (engine.returncode, engine.stdout.strip().lower()) != (1, 'stopped'):
+                    raise RuntimeError('Could not confirm that the OrbStack engine is stopped')
+                if not is_running(app):
+                    before = vendor['installed']
+                    command([str(cli), 'update'], log, timeout=600)
+                    if vendor_install.ownership(receipts, app) != owner or not all(os.access(b, os.X_OK) for b in owner[2]):
+                        raise RuntimeError('OrbStack updater did not preserve its Mise receipt and launchers')
+                    vendor = assess()
+                    if vendor['state'] == 'current' and vendor['installed'] != before:
+                        return {'state': 'updated', 'vendor_check': vendor,
+                                'vendor_upgrade': {'before': before, 'after': vendor['installed'], 'updater': 'orbctl'}}
     else:
         native = native_cask_update(key, check, log, command)
         if check or not app.exists():
@@ -1409,7 +1445,7 @@ def cask_update(key, check, log, command):
     if release is not None and vendor_error is None:
         # Re-read the live bundle after native installation; reuse this run's
         # release evidence rather than racing a second network metadata fetch.
-        native_state = result['state']
+        native_finished = native_allows_vendor_update(result)
         assessment = assess_vendor_release(key, release)
         result['vendor_check'] = assessment
         result['availability'] = 'confirmed'
@@ -1422,7 +1458,7 @@ def cask_update(key, check, log, command):
             result['plans'] = [{'name': label(key), 'kind': 'version',
                                 'before': assessment['installed'], 'after': assessment['available']}]
             if not check and result['state'] == 'update-available':
-                if release.get('artifact') and native_state in ('current', 'updated') and assessment['installed']:
+                if release.get('artifact') and native_finished and assessment['installed']:
                     outcome = vendor_install.install(app, PREFIX / 'Caskroom' / key.removeprefix('brew-cask:'),
                         release['artifact'], partial(assess_vendor_release, key, release), is_running,
                         lambda args, **kw: command(args, log, **kw))

@@ -44,21 +44,78 @@ def copy_bundle(source, target, run):
     if len(bundles) != 1:
         raise ValueError('Expected one application at the root of the vendor installer')
     run(['/usr/bin/ditto', bundles[0], target], timeout=300)
+    if target.name == 'Google Chrome.app':
+        clear_chrome_finder_info(target, run)
 
 
-def stage(artifact, target, run):
-    url, algorithm, expected = (artifact[k] for k in ('url', 'algorithm', 'digest'))
+def clear_chrome_finder_info(copy, run):
+    # Only use on private copies. -s acts on symbolic links themselves; quarantine and
+    # every other extended attribute are preserved for signature and Gatekeeper checks.
+    run(['/usr/bin/xattr', '-rds', 'com.apple.FinderInfo', copy], timeout=120)
+
+
+def publisher_requirement(app, run):
+    developer_id = 'anchor apple generic and certificate leaf[field.1.2.840.113635.100.6.1.13] exists'
+    try:
+        run(['/usr/bin/codesign', '--verify', '--strict', '-R', '=' + developer_id, app], timeout=120)
+    except RuntimeError:
+        if app.name != 'Google Chrome.app':
+            raise
+        # Google's old helper bundles can retain Finder display metadata. Verify the
+        # live code and sealed symlinks, then verify every framework under full strict
+        # rules on a private clone with just that metadata removed.
+        google = f'={developer_id} and certificate leaf[subject.OU] = "EQHXZ8M8AV"'
+        requirement = google + ' and identifier "com.google.Chrome"'
+        run(['/usr/bin/codesign', '--verify', '--deep', '--strict=symlinks', '-R', requirement, app], timeout=180)
+        with tempfile.TemporaryDirectory(prefix='mise-chrome-signature-') as tmp:
+            copy = Path(tmp) / app.name
+            run(['/usr/bin/ditto', '--clone', app, copy], timeout=300)
+            clear_chrome_finder_info(copy, run)
+            run(['/usr/bin/codesign', '--verify', '--deep', '--strict', '-R', requirement, copy], timeout=180)
+        return google
+    details = command_output(['/usr/bin/codesign', '-dv', '--verbose=4', app])
+    team = re.search(r'(?m)^TeamIdentifier=([A-Z0-9]{10})$', details)
+    if not team:
+        raise ValueError('Could not verify the installed Developer ID team and bundle identity')
+    return f'={developer_id} and certificate leaf[subject.OU] = "{team[1]}"'
+
+
+def verify_archive(path, artifact, app, run):
+    method = artifact['algorithm']
+    if method in ('sha256', 'sha512'):
+        verify_artifact(path, method, artifact['digest'])
+        return
+    requirement = publisher_requirement(app, run)
+    if method == 'developer-id-dmg':
+        run(['/usr/bin/codesign', '--verify', '--strict', '-R', requirement, path], timeout=180)
+        return
+    installed = plistlib.loads((app / 'Contents/Info.plist').read_bytes())
+    key = installed.get('SUPublicEDKey', '')
+    if (installed.get('SURequireSignedFeed') or not re.fullmatch(r'[A-Za-z0-9+/]{43}=', key)
+            or path.stat().st_size != artifact['size']):
+        raise ValueError('Sparkle signing key, feed policy or archive length precludes this update')
+    run(['node', Path(__file__).with_name('verify-sparkle.cjs'), key, artifact['signature'], path], timeout=120)
+
+
+def stage(artifact, target, run, installed):
+    url, algorithm = artifact['url'], artifact['algorithm']
     parts = urlsplit(url)
     suffix = Path(parts.path).suffix
-    if (parts.scheme != 'https' or not parts.hostname or suffix not in ('.dmg', '.zip')
-            or algorithm not in ('sha256', 'sha512')
-            or not re.fullmatch(r'[0-9a-f]{%d}' % (hashlib.new(algorithm).digest_size * 2), expected)):
-        raise ValueError('Vendor installer requires a supported HTTPS archive and publisher checksum')
+    if parts.scheme != 'https' or not parts.hostname or suffix not in ('.dmg', '.zip'):
+        raise ValueError('Vendor installer requires a supported HTTPS archive')
+    if algorithm in ('sha256', 'sha512'):
+        if not re.fullmatch(r'[0-9a-f]{%d}' % (hashlib.new(algorithm).digest_size * 2), artifact.get('digest', '')):
+            raise ValueError('Invalid publisher checksum')
+    elif algorithm == 'sparkle-ed25519':
+        if not re.fullmatch(r'[A-Za-z0-9+/]{86}==', artifact.get('signature', '')) or not 0 < artifact['size'] <= 2**31:
+            raise ValueError('Invalid Sparkle signature or size')
+    elif algorithm != 'developer-id-dmg' or suffix != '.dmg':
+        raise ValueError('Unsupported vendor archive verification method')
     with tempfile.TemporaryDirectory(prefix='mise-vendor-download-') as tmp:
         archive = Path(tmp) / ('release' + suffix)
         run(['/usr/bin/curl', '-qfsSL', '--proto', '=https', '--proto-redir', '=https', '--retry', '2',
-             '--connect-timeout', '15', '--max-time', '300', '--output', archive, url], timeout=330)
-        verify_artifact(archive, algorithm, expected)
+             '--connect-timeout', '15', '--max-time', '300', '--max-filesize', str(artifact.get('size', 2**31)), '--output', archive, url], timeout=330)
+        verify_archive(archive, artifact, installed, run)
         if suffix == '.zip':
             source = Path(tmp) / 'extracted'
             source.mkdir()
@@ -81,14 +138,10 @@ def stage(artifact, target, run):
 def verify_candidate(app, staged, binaries, run):
     info = plistlib.loads((staged / 'Contents/Info.plist').read_bytes())
     # Bind the new signature to the trusted, currently installed publisher and bundle.
-    developer_id = 'anchor apple generic and certificate leaf[field.1.2.840.113635.100.6.1.13] exists'
-    run(['/usr/bin/codesign', '--verify', '--strict', '-R', '=' + developer_id, app], timeout=120)
-    details = command_output(['/usr/bin/codesign', '-dv', '--verbose=4', app])
-    team = re.search(r'(?m)^TeamIdentifier=([A-Z0-9]{10})$', details)
     identifier = info['CFBundleIdentifier']
-    if not team or not re.fullmatch(r'[A-Za-z0-9.-]+', identifier):
-        raise ValueError('Could not verify the installed Developer ID team and bundle identity')
-    requirement = f'={developer_id} and certificate leaf[subject.OU] = "{team[1]}" and identifier "{identifier}"'
+    if not re.fullmatch(r'[A-Za-z0-9.-]+', identifier):
+        raise ValueError('Invalid bundle identifier')
+    requirement = publisher_requirement(app, run) + f' and identifier "{identifier}"'
     run(['/usr/bin/codesign', '--verify', '--deep', '--strict', '-R', requirement, staged], timeout=180)
     run(['/usr/sbin/spctl', '--assess', '--type', 'execute', staged], timeout=120)
     executable = info['CFBundleExecutable']
@@ -140,7 +193,7 @@ def install(app, receipts, artifact, assess, running, run):
     candidate = directory / app.name
     preserve = False
     try:
-        stage(artifact, candidate, run)
+        stage(artifact, candidate, run, app)
         if assess(candidate)['state'] != 'current':
             raise ValueError('Staged app does not match the advertised stable release')
         verify_candidate(app, candidate, owner[2], run)

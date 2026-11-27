@@ -13,7 +13,7 @@ import time
 import sys
 import tomllib
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 
@@ -482,6 +482,30 @@ class OrbStackUpdateTests(unittest.TestCase):
         for call in cli.call_args_list:
             self.assertEqual(call.args[0], [str(self.app / 'Contents/MacOS/bin/orbctl'), 'update', '--check'])
         return result, native.call_count
+
+    def test_exact_native_version_skip_can_fall_back_without_ignoring_other_warnings(self):
+        case = 'mise brew-cask:orbstack: skipped: installed app is current, newer, or incomparable'
+        for output, allowed in [(case, True), (case + '\nWARN ownership changed', False),
+                                (case + '\nother skipped: busy', False)]:
+            native = maintenance.cask_result(output, False, applied_cask='orbstack')
+            self.assertEqual(maintenance.native_allows_vendor_update(native), allowed)
+
+    def test_vendor_updater_requires_managed_idle_engine_then_rechecks(self):
+        pending = {'state': 'update-available', 'installed': '2.2.4'}
+        current = {'state': 'current', 'installed': '2.2.5'}
+        for code, status, expected in [(1, 'Stopped', 'updated'), (0, 'Running', 'deferred-running-app'),
+                                       (2, 'Starting', 'deferred-running-app')]:
+            command = Mock()
+            with patch.object(maintenance, 'orbstack_assessment', side_effect=[pending, pending, current]), \
+                 patch.object(maintenance, 'is_running', return_value=False), \
+                 patch.object(maintenance, 'native_cask_update', return_value={'state': 'current'}), \
+                 patch.object(maintenance.vendor_install, 'ownership', return_value=(None, b'receipt', [])), \
+                 patch.object(maintenance.subprocess, 'run', return_value=maintenance.subprocess.CompletedProcess([], code, status, '')):
+                result = maintenance.cask_update(self.key, False, io.StringIO(), command)
+                self.assertEqual(result['state'], expected)
+                self.assertEqual(command.call_count, int(expected == 'updated'))
+                if command.called:
+                    self.assertEqual(command.call_args.args[0], [str(self.app / 'Contents/MacOS/bin/orbctl'), 'update'])
 
     def test_official_check_skips_replacement_and_does_not_execute_unknown_bundles(self):
         result, applied = self.evaluate([0])

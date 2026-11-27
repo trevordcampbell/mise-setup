@@ -96,6 +96,40 @@ def checksum_asset(url, sha256):
     return {}
 
 
+def signed_image(url):
+    return {'artifact': {'url': url, 'algorithm': 'developer-id-dmg'}}
+
+
+def sparkle_asset(item, enclosure):
+    url = enclosure.get('url', '')
+    signature = enclosure.get(S + 'edSignature', '')
+    length = enclosure.get('length', '')
+    # Defer restricted rollouts, deltas and guided/package installers to Sparkle itself.
+    if (not urlsplit(url).path.endswith(('.zip', '.dmg')) or not re.fullmatch(r'[A-Za-z0-9+/]{86}==', signature)
+            or not re.fullmatch(r'[1-9][0-9]{0,9}', length) or enclosure.get(S + 'deltaFrom')
+            or enclosure.get(S + 'installationType', 'application') != 'application'
+            or any(item.find(S + key) is not None for key in
+                   ('phasedRolloutInterval', 'minimumAutoupdateVersion', 'informationalUpdate',
+                    'minimumUpdateVersion', 'maximumUpdateVersion', 'installationType'))):
+        return {}
+    return {'artifact': {'url': url, 'algorithm': 'sparkle-ed25519', 'signature': signature, 'size': int(length)}}
+
+
+def published_zip(repo, tag, asset):
+    # The vendor's other release endpoint determines eligibility; bind this lookup to that exact tag.
+    try:
+        data = github_json(f'https://api.github.com/repos/{repo}/releases/tags/{tag}')
+    except (OSError, RuntimeError):
+        return {}
+    url = f'https://github.com/{repo}/releases/download/{tag}/{asset}'
+    matches = [a for a in data.get('assets', []) if a.get('name') == asset and a.get('browser_download_url') == url]
+    if data.get('draft') is False and data.get('prerelease') is False and data.get('tag_name') == tag and len(matches) == 1:
+        digest = matches[0].get('digest') or ''
+        if digest.startswith('sha256:'):
+            return checksum_asset(url, digest[7:])
+    return {}
+
+
 def electron_asset(files, asset, url):
     # Bind the digest to the matching files[] entry, never the top-level default artifact.
     rows = re.split(r'(?m)^[ \t]+- url: ', files)[1:]
@@ -149,7 +183,7 @@ def github_release(name, arch):
         match = re.fullmatch(re.escape(f'https://github.com/{repo}/releases/download/') + r'v([0-9.]+)/macsfancontrol\.zip', target)
         if not match or urlsplit(first_redirect(target)).hostname != 'release-assets.githubusercontent.com':
             raise ValueError('Missing published Macs Fan Control installer')
-        return release(source, match[1])
+        return release(source, match[1], **published_zip(repo, 'v' + match[1], template))
     except OSError:
         # The public release/download routes do not consume REST API quota.
         return github_api_release(name, arch)
@@ -180,7 +214,7 @@ def sparkle_release(name, arch):
             build = field('version') or enclosure.get(S + 'version')
             version = field('shortVersionString') or enclosure.get(S + 'shortVersionString') or build
             numbers(build)
-            choices.append(release(source, version, build=build))
+            choices.append(release(source, version, build=build, **sparkle_asset(item, enclosure)))
     if not choices:
         raise ValueError('No compatible stable macOS release in the vendor appcast')
     return max(choices, key=lambda row: numbers(row['build']))
@@ -198,7 +232,11 @@ def redirected_release(name, arch):
         match = re.fullmatch(pattern, response.geturl())
     if not match:
         raise ValueError('Vendor redirect did not identify the expected stable macOS artifact')
-    return release(source, match[1])
+    if name == 'github':
+        artifact = published_zip('desktop/desktop', 'release-' + match[1], f'GitHub.Desktop-{arch}.zip')
+    else:
+        artifact = signed_image(match[0])
+    return release(source, match[1], **artifact)
 
 
 def editor_release(name, arch):
@@ -230,8 +268,19 @@ def opera_release():
             if error.code == 404:
                 continue
             raise
-        if f'href="Opera_{version}_Setup.dmg"'.encode() in listing:
-            return release(source, version)
+        filename = f'Opera_{version}_Setup.dmg'
+        if f'href="{filename}"'.encode() in listing:
+            url = f'{source}{version}/mac/{filename}'
+            artifact = {}
+            if f'href="{filename}.sha256sum"'.encode() in listing:
+                try:
+                    manifest = fetch(url + '.sha256sum').decode('ascii').strip()
+                except OSError:
+                    manifest = ''
+                match = re.fullmatch(r'([0-9a-fA-F]{64})(?:[ \t]+\*?' + re.escape(filename) + r')?', manifest)
+                if match:
+                    artifact = checksum_asset(url, match[1])
+            return release(source, version, **artifact)
     raise ValueError('Could not identify a recent stable Opera release with a macOS installer')
 
 
@@ -327,10 +376,11 @@ def latest(name, state, write):
         data = json.loads(fetch(source))
         version = data['currentRelease']
         pattern = rf'https://downloads\.claude\.ai/releases/darwin/universal/{re.escape(version)}/Claude-[a-f0-9]+\.zip'
-        if not any(row.get('version') == version and row['updateTo']['version'] == version
-                   and re.fullmatch(pattern, row['updateTo']['url']) for row in data['releases']):
+        matches = [row['updateTo']['url'] for row in data['releases'] if row.get('version') == version
+                   and row['updateTo']['version'] == version and re.fullmatch(pattern, row['updateTo']['url'])]
+        if len(matches) != 1:
             raise ValueError('Missing current universal macOS release in the Claude Desktop feed')
-        return release(source, version)
+        return release(source, version, **signed_image(matches[0][:-4] + '.dmg'))
     if name == 'ledger-wallet':
         return electron_release('https://download.live.ledger.com/latest-mac.yml', 'ledger-live-desktop-{v}-mac.zip', arch)
     raise ValueError(f'Unknown desktop release source for {name}')

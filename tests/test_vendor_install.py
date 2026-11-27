@@ -1,5 +1,8 @@
 import base64
 import hashlib
+import plistlib
+import shutil
+import subprocess
 from pathlib import Path
 import tempfile
 import unittest
@@ -28,7 +31,7 @@ class VendorInstallTests(unittest.TestCase):
         return {'installed': version, 'state': {'1': 'update-available', '2': 'current', '3': 'newer'}[version]}
 
     @staticmethod
-    def stage(artifact, candidate, run):
+    def stage(artifact, candidate, run, installed):
         candidate.mkdir()
         (candidate / 'version').write_text('2')
 
@@ -84,6 +87,60 @@ class VendorInstallTests(unittest.TestCase):
             self.install(assess=assess)
         self.assertEqual(self.assess(self.app)['installed'], '1')
         self.assertFalse(list(self.root.glob('.mise-vendor-*')))
+
+    def test_signed_image_must_pass_installed_team_requirement_before_mounting(self):
+        run = Mock()
+        def command(args, **kwargs):
+            if args[0] == '/usr/bin/codesign':
+                raise RuntimeError('wrong publisher')
+        run.side_effect = command
+        with patch.object(vendor, 'publisher_requirement', return_value='=same team'), self.assertRaisesRegex(RuntimeError, 'wrong publisher'):
+            vendor.stage(feeds.signed_image('https://example.org/a.dmg')['artifact'], self.root / 'stage', run, self.app)
+        self.assertFalse(any(call.args[0][0] == '/usr/bin/hdiutil' for call in run.call_args_list))
+        with self.assertRaisesRegex(ValueError, 'Unsupported'):
+            vendor.stage(feeds.signed_image('https://example.org/a.zip')['artifact'], self.root / 'stage', run, self.app)
+
+    def test_chrome_finder_metadata_is_cleared_only_on_a_private_copy(self):
+        chrome = self.root / 'Google Chrome.app'
+        calls = []
+        def run(args, **kwargs):
+            calls.append(args)
+            if args[-1] == chrome and '--strict' in args:
+                raise RuntimeError('unexpected Finder metadata')
+        result = vendor.publisher_requirement(chrome, run)
+        self.assertIn('EQHXZ8M8AV', result)
+        clear = next(c for c in calls if c[0] == '/usr/bin/xattr')
+        self.assertEqual(clear[1:3], ['-rds', 'com.apple.FinderInfo'])
+        self.assertNotEqual(clear[-1], chrome)
+        self.assertIn('--strict', calls[-1])
+        self.assertEqual(calls[-1][-1], clear[-1])
+        def bad_copy(args, **kwargs):
+            if '--strict' in args:
+                raise RuntimeError('signature rejected')
+        with self.assertRaisesRegex(RuntimeError, 'signature rejected'):
+            vendor.publisher_requirement(chrome, bad_copy)
+
+    @unittest.skipUnless(shutil.which('node'), 'Node verifies Sparkle archives')
+    def test_sparkle_accepts_only_signature_from_installed_app(self):
+        # RFC 8032 test 1, the signature of the empty message.
+        key = bytes.fromhex('d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a')
+        signature = bytes.fromhex('e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e06522490155'
+                                  '5fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b')
+        info = self.app / 'Contents/Info.plist'
+        info.parent.mkdir()
+        info.write_bytes(plistlib.dumps({'SUPublicEDKey': base64.b64encode(key).decode()}))
+        path = self.root / 'archive'
+        path.touch()
+        artifact = {'algorithm': 'sparkle-ed25519', 'signature': base64.b64encode(signature).decode(), 'size': 0}
+        def run(args, **kwargs):
+            subprocess.run(args, check=True, capture_output=True, **kwargs)
+        with patch.object(vendor, 'publisher_requirement'):
+            vendor.verify_archive(path, artifact, self.app, run)
+            path.write_bytes(b'changed')
+            with self.assertRaisesRegex(ValueError, 'length'):
+                vendor.verify_archive(path, artifact, self.app, run)
+            with self.assertRaises(subprocess.CalledProcessError):
+                vendor.verify_archive(path, dict(artifact, size=7), self.app, run)
 
     def test_digest_must_match_download_and_specific_asset(self):
         blob = self.root / 'asset'
