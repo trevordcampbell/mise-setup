@@ -13,6 +13,12 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 import xml.etree.ElementTree as ET
 
 
+if __package__:
+    from .github_public import github_json
+else:
+    from github_public import github_json
+
+
 APPS = {
     'bruno': ('Bruno.app', 'com.usebruno.app'),
     'discord': ('Discord.app', 'com.hnc.Discord'),
@@ -101,7 +107,7 @@ def electron_release(source, template, arch):
 def github_api_release(name, arch):
     repo, template = GITHUB_RELEASES[name]
     source = f'https://api.github.com/repos/{repo}/releases/latest'
-    data = json.loads(fetch(source))
+    data = github_json(source)
     tag = data['tag_name']
     version = tag.removeprefix('v')
     asset = template.format(v=version, arch=arch)

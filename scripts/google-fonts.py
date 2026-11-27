@@ -13,6 +13,11 @@ import tempfile
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
+if __package__:
+    from .github_public import github_json
+else:
+    from github_public import github_json
+
 ROOT = Path.home() / '.local/share/mise/font-sources'
 FAMILIES = {'opensans': 'OpenSans', 'rubik': 'Rubik', 'spacegrotesk': 'SpaceGrotesk'}
 
@@ -24,7 +29,7 @@ def fetch(url):
 
 
 def api(path):
-    return json.loads(fetch('https://api.github.com/repos/google/fonts/' + path))
+    return github_json('https://api.github.com/repos/google/fonts/' + path, timeout=45)
 
 
 def git_blob_sha(data):

@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-spec = importlib.util.spec_from_file_location('fonts', Path(__file__).resolve().parents[1] / 'scripts/google-fonts.py')
+spec = importlib.util.spec_from_file_location('scripts.google_fonts', Path(__file__).resolve().parents[1] / 'scripts/google-fonts.py')
 fonts = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(fonts)
 

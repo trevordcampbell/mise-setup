@@ -30,10 +30,10 @@ class DesktopReleaseTests(unittest.TestCase):
             asset = template.format(v=v, arch='arm64')
             data = {'tag_name': 'v' + v, 'draft': False, 'prerelease': False,
                     'assets': [{'name': asset, 'browser_download_url': f'https://github.com/{repo}/releases/download/v{v}/{asset}'}]}
-            with patch.object(releases, 'fetch', return_value=json.dumps(data).encode()):
+            with patch.object(releases, 'github_json', return_value=data):
                 self.assertEqual(releases.github_api_release(name, 'arm64')['version'], v)
             for override in ({'draft': True}, {'prerelease': True}, {'assets': []}):
-                with self.subTest(name=name, override=override), patch.object(releases, 'fetch', return_value=json.dumps(dict(data, **override)).encode()), self.assertRaises(ValueError):
+                with self.subTest(name=name, override=override), patch.object(releases, 'github_json', return_value=dict(data, **override)), self.assertRaises(ValueError):
                     releases.github_api_release(name, 'arm64')
 
     def test_publisher_routes_do_not_need_github_api_quota(self):

@@ -29,8 +29,10 @@ from urllib.request import Request, urlopen
 
 if __package__:
     from . import dependency_audit, audit_reviews, desktop_releases
+    from .github_public import github_json
 else:
     import dependency_audit, audit_reviews, desktop_releases
+    from github_public import github_json
 
 HOME = Path.home()
 CONFIG = HOME / '.config/mise/config.toml'
@@ -721,6 +723,8 @@ def cask_apps(name):
 
 
 def json_url(url):
+    if url.startswith('https://api.github.com/repos/'):
+        return github_json(url)
     req = Request(url, headers={'User-Agent': 'mise-local-maintenance', 'Accept': 'application/vnd.github+json'})
     with urlopen(req, timeout=30) as response:
         return json.load(response)
