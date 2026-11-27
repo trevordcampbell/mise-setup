@@ -1,4 +1,5 @@
 """Read stable macOS release metadata for self-updating desktop applications."""
+import base64
 import json
 import os
 from pathlib import Path
@@ -7,7 +8,7 @@ import plistlib
 import re
 import subprocess
 import tempfile
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 from urllib.error import HTTPError
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 import xml.etree.ElementTree as ET
@@ -89,6 +90,24 @@ def first_redirect(url):
             return error.headers['Location'] or ''
 
 
+def checksum_asset(url, sha256):
+    if isinstance(sha256, str) and re.fullmatch(r'[0-9a-fA-F]{64}', sha256):
+        return {'artifact': {'url': url, 'algorithm': 'sha256', 'digest': sha256.lower()}}
+    return {}
+
+
+def electron_asset(files, asset, url):
+    # Bind the digest to the matching files[] entry, never the top-level default artifact.
+    rows = re.split(r'(?m)^[ \t]+- url: ', files)[1:]
+    matches = [row for row in rows if row.splitlines()[0].strip() == asset]
+    if len(matches) != 1:
+        return {}
+    digests = re.findall(r'(?m)^[ \t]+sha512: ([A-Za-z0-9+/]{86}==)[ \t]*$', matches[0])
+    if len(digests) != 1:
+        return {}
+    return {'artifact': {'url': url, 'algorithm': 'sha512', 'digest': base64.b64decode(digests[0]).hex()}}
+
+
 def electron_release(source, template, arch):
     feed = fetch(source).decode().replace('\r\n', '\n') + '\n'
     versions = re.findall(r'''(?m)^version: (['"]?)([0-9.]+)\1[ \t]*$''', feed)
@@ -101,7 +120,7 @@ def electron_release(source, template, arch):
         raise ValueError('Missing release artifact for this Mac')
     if re.search(r'(?m)^minimumSystemVersion:|^stagingPercentage:(?! 100[ \t]*$)', feed):
         raise ValueError('Release eligibility is restricted by the vendor')
-    return release(source, version)
+    return release(source, version, **electron_asset(files[0], asset, urljoin(source, asset)))
 
 
 def github_api_release(name, arch):
@@ -112,10 +131,11 @@ def github_api_release(name, arch):
     version = tag.removeprefix('v')
     asset = template.format(v=version, arch=arch)
     expected = f'https://github.com/{repo}/releases/download/{tag}/{asset}'
-    if data['draft'] or data['prerelease'] or not any(a['name'] == asset and a['browser_download_url'] == expected
-                                                     for a in data['assets']):
+    assets = [a for a in data['assets'] if a['name'] == asset and a['browser_download_url'] == expected]
+    if data['draft'] or data['prerelease'] or len(assets) != 1:
         raise ValueError('The GitHub release lacks a published stable macOS installer for this architecture')
-    return release(source, version)
+    digest = assets[0].get('digest') or ''
+    return release(source, version, **(checksum_asset(expected, digest[7:]) if digest.startswith('sha256:') else {}))
 
 
 def github_release(name, arch):
@@ -196,7 +216,7 @@ def editor_release(name, arch):
         artifact = rf'https://vscode\.download\.prss\.microsoft\.com/dbazure/download/stable/[0-9a-f]+/VSCode-{target}\.zip'
     if not re.fullmatch(artifact, data['url']):
         raise ValueError('Unexpected installer in the stable editor release feed')
-    return release(source, version)
+    return release(source, version, **checksum_asset(data['url'], data.get('sha256hash')))
 
 
 def opera_release():

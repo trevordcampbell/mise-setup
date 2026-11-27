@@ -28,10 +28,10 @@ import xml.etree.ElementTree as ET
 from urllib.request import Request, urlopen
 
 if __package__:
-    from . import dependency_audit, audit_reviews, desktop_releases
+    from . import dependency_audit, audit_reviews, desktop_releases, vendor_install
     from .github_public import github_json
 else:
-    import dependency_audit, audit_reviews, desktop_releases
+    import dependency_audit, audit_reviews, desktop_releases, vendor_install
     from github_public import github_json
 
 HOME = Path.home()
@@ -1230,9 +1230,10 @@ def vendor_release(key):
         artifact = (r'https://storage\.googleapis\.com/antigravity-public/antigravity-hub/'
                     + re.escape(version) + rf'-[0-9]+/darwin-{artifact_arch}/Antigravity\.zip')
         urls = re.findall(r'(?m)^[ \t]+- url:[ \t]+(\S+)[ \t]*$', files[0])
-        if not any(re.fullmatch(artifact, url) for url in urls):
+        matched = [url for url in urls if re.fullmatch(artifact, url)]
+        if len(matched) != 1:
             raise ValueError('Antigravity desktop manifest lacks a matching Google macOS update artifact')
-        return {'version': version, 'source': source, 'channel': 'stable'}
+        return desktop_releases.release(source, version, **desktop_releases.electron_asset(files[0], matched[0], matched[0]))
     if key == 'brew-cask:cursor':
         arch = 'arm64' if arm else 'x64'
         source = f'https://api2.cursor.sh/updates/api/update/darwin-{arch}/cursor/0.0.0/stable'
@@ -1241,7 +1242,7 @@ def vendor_release(key):
         numeric_version(version)
         if not re.fullmatch(r'https://downloads\.cursor\.com/production/[0-9a-f]{40}/darwin/' + arch + r'/Cursor-darwin-' + arch + r'\.zip', data['url']):
             raise ValueError('Unexpected Cursor stable artifact')
-        return {'version': version, 'source': source, 'channel': 'stable'}
+        return desktop_releases.release(source, version, **desktop_releases.checksum_asset(data['url'], data.get('sha256hash')))
     if key == 'brew-cask:google-chrome':
         # A partial Chrome rollout is not the release the stable DMG serves.
         source = 'https://versionhistory.googleapis.com/v1/chrome/platforms/mac/channels/stable/versions/all/releases?filter=endtime%3Dnone,fraction%3D1'
@@ -1288,9 +1289,10 @@ def vendor_release(key):
     return None
 
 
-def assess_vendor_release(key, release):
+def assess_vendor_release(key, release, app=None):
     filename, identifier = VENDOR_APPS[key]
-    app = APPLICATIONS / filename
+    if app is None:
+        app = APPLICATIONS / filename
     if not app.exists():
         available = release['version']
         if release.get('build'):
@@ -1407,6 +1409,7 @@ def cask_update(key, check, log, command):
     if release is not None and vendor_error is None:
         # Re-read the live bundle after native installation; reuse this run's
         # release evidence rather than racing a second network metadata fetch.
+        native_state = result['state']
         assessment = assess_vendor_release(key, release)
         result['vendor_check'] = assessment
         result['availability'] = 'confirmed'
@@ -1419,6 +1422,16 @@ def cask_update(key, check, log, command):
             result['plans'] = [{'name': label(key), 'kind': 'version',
                                 'before': assessment['installed'], 'after': assessment['available']}]
             if not check and result['state'] == 'update-available':
+                if release.get('artifact') and native_state in ('current', 'updated') and assessment['installed']:
+                    outcome = vendor_install.install(app, PREFIX / 'Caskroom' / key.removeprefix('brew-cask:'),
+                        release['artifact'], partial(assess_vendor_release, key, release), is_running,
+                        lambda args, **kw: command(args, log, **kw))
+                    result.update(outcome)
+                    if result['state'] in ('current', 'newer', 'updated'):
+                        result.pop('plans', None)
+                    if 'vendor_upgrade' in result:
+                        log.write(f'[{now()}] {key} verified vendor upgrade: {json.dumps(result["vendor_upgrade"])}\n')
+                    return result
                 result['notes'] = ['Vendor confirms an update, but the native installer did not apply it. '
                                    'Its cask may lag the vendor release; use the app updater or retry later.']
     elif vendor_error:

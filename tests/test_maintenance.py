@@ -263,6 +263,24 @@ class VendorReleaseTests(unittest.TestCase):
         self.assertEqual(result['state'], 'current')
         self.assertEqual(calls, [[maintenance.MISE, 'bootstrap', 'packages', 'apply', self.key, '-y']])
 
+    def test_vendor_fallback_follows_native_and_skips_previews_open_apps_and_ambiguous_native_results(self):
+        release = dict(self.release, artifact={'url': 'https://example.invalid/release.dmg'})
+        for preview, running, native_state, use in [(False, False, 'current', True),
+                (True, False, 'checked', False), (False, True, 'current', False),
+                (False, False, 'availability-unknown', False)]:
+            with self.subTest(preview=preview, running=running, native=native_state), \
+                 patch.object(maintenance, 'vendor_release', return_value=release), \
+                 patch.object(maintenance, 'is_running', return_value=running), \
+                 patch.object(maintenance, 'native_cask_update', return_value={'state': native_state}) as native, \
+                 patch.object(maintenance.vendor_install, 'install', return_value={'state': 'updated',
+                    'vendor_check': {'state': 'current'}, 'vendor_upgrade': {'after': release['version']}}) as install:
+                result = maintenance.cask_update(self.key, preview, io.StringIO(), None)
+                native.assert_called_once()
+                self.assertEqual(install.called, use)
+                if use:
+                    self.assertEqual(result['state'], 'updated')
+                    self.assertNotIn('plans', result)
+
     def test_native_metadata_lag_does_not_hide_vendor_update(self):
         with patch.object(maintenance, 'vendor_release', return_value=self.release), patch.object(maintenance, 'native_cask_update', return_value={'state': 'current'}), patch.object(maintenance, 'is_running', return_value=False):
             result = maintenance.cask_update(self.key, False, io.StringIO(), None)
