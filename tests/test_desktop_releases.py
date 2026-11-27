@@ -30,18 +30,39 @@ class DesktopReleaseTests(unittest.TestCase):
             asset = template.format(v=v, arch='arm64')
             data = {'tag_name': 'v' + v, 'draft': False, 'prerelease': False,
                     'assets': [{'name': asset, 'browser_download_url': f'https://github.com/{repo}/releases/download/v{v}/{asset}'}]}
-            self.assertEqual(self.resolve(name, data)['version'], v)
+            with patch.object(releases, 'fetch', return_value=json.dumps(data).encode()):
+                self.assertEqual(releases.github_api_release(name, 'arm64')['version'], v)
             for override in ({'draft': True}, {'prerelease': True}, {'assets': []}):
-                with self.subTest(name=name, override=override), self.assertRaises(ValueError):
-                    self.resolve(name, dict(data, **override))
+                with self.subTest(name=name, override=override), patch.object(releases, 'fetch', return_value=json.dumps(dict(data, **override)).encode()), self.assertRaises(ValueError):
+                    releases.github_api_release(name, 'arm64')
+
+    def test_publisher_routes_do_not_need_github_api_quota(self):
+        for name in ('t3-code', 'bruno'):
+            _, template = releases.GITHUB_RELEASES[name]
+            asset = template.format(v='1.2.3', arch='arm64')
+            data = f"version: '1.2.3'\nfiles:\n  - url: {asset}\n".encode()
+            with patch.object(releases, 'github_api_release', side_effect=AssertionError('REST API used')):
+                self.assertEqual(self.resolve(name, data)['version'], '1.2.3')
+                with self.assertRaises(ValueError):
+                    self.resolve(name, data.replace(b'arm64', b'x64'))
+        targets = ['https://github.com/crystalidea/macs-fan-control/releases/download/v1.5.23/macsfancontrol.zip',
+                   'https://release-assets.githubusercontent.com/signed-asset']
+        with patch.object(releases, 'first_redirect', side_effect=targets):
+            self.assertEqual(releases.github_release('macs-fan-control', 'arm64')['version'], '1.5.23')
 
     def test_discord_postman_and_ledger_stable_macos_releases(self):
         discord = {'full': {'host_version': [0, 0, 424],
                             'url': 'https://stable.dl2.discordapp.net/distro/app/stable/osx/universal/0.0.424/full.distro'}}
-        self.assertEqual(self.resolve('discord', discord)['version'], '0.0.424')
-        discord['full']['host_version'] = [9, 9, 9]
-        with self.assertRaises(ValueError):
-            self.resolve('discord', discord)
+        target = 'https://stable.dl2.discordapp.net/distro/app/stable/osx/universal/0.0.425/Discord.dmg'
+        with patch.object(releases, 'first_redirect', return_value=target):
+            self.assertEqual(self.resolve('discord', {})['version'], '0.0.425')
+        with patch.object(releases, 'first_redirect', side_effect=OSError('unavailable')):
+            self.assertEqual(self.resolve('discord', discord)['version'], '0.0.424')
+            discord['full']['url'] += '?signed=example'
+            self.assertEqual(self.resolve('discord', discord)['version'], '0.0.424')
+            discord['full']['host_version'] = [9, 9, 9]
+            with self.assertRaises(ValueError):
+                self.resolve('discord', discord)
         self.assertEqual(self.resolve('postman', {'version': '12.38.6'})['version'], '12.38.6')
         with self.assertRaises(ValueError):
             self.resolve('postman', {'version': '13.0.0-beta'})

@@ -9,7 +9,7 @@ import subprocess
 import tempfile
 from urllib.parse import urlsplit
 from urllib.error import HTTPError
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 import xml.etree.ElementTree as ET
 
 
@@ -68,7 +68,37 @@ def fetch(url):
     return data
 
 
-def github_release(name, arch):
+def first_redirect(url):
+    """Read a publisher's Location header without fetching an installer or signed asset."""
+    class StopAtRedirect(HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+    try:
+        with build_opener(StopAtRedirect()).open(request(url, 'HEAD'), timeout=15):
+            raise ValueError('Expected a versioned installer redirect')
+    except HTTPError as error:
+        with error:
+            if error.code not in (301, 302, 303, 307, 308):
+                raise
+            return error.headers['Location'] or ''
+
+
+def electron_release(source, template, arch):
+    feed = fetch(source).decode().replace('\r\n', '\n') + '\n'
+    versions = re.findall(r'''(?m)^version: (['"]?)([0-9.]+)\1[ \t]*$''', feed)
+    files = re.findall(r'(?m)^files:[ \t]*\n((?:[ \t].*\n)+)', feed)
+    if len(versions) != 1 or len(files) != 1:
+        raise ValueError('Unrecognized macOS release manifest')
+    version = versions[0][1]
+    asset = template.format(v=version, arch=arch)
+    if asset not in re.findall(r'(?m)^[ \t]+- url: (\S+)[ \t]*$', files[0]):
+        raise ValueError('Missing release artifact for this Mac')
+    if re.search(r'(?m)^minimumSystemVersion:|^stagingPercentage:(?! 100[ \t]*$)', feed):
+        raise ValueError('Release eligibility is restricted by the vendor')
+    return release(source, version)
+
+
+def github_api_release(name, arch):
     repo, template = GITHUB_RELEASES[name]
     source = f'https://api.github.com/repos/{repo}/releases/latest'
     data = json.loads(fetch(source))
@@ -80,6 +110,23 @@ def github_release(name, arch):
                                                      for a in data['assets']):
         raise ValueError('The GitHub release lacks a published stable macOS installer for this architecture')
     return release(source, version)
+
+
+def github_release(name, arch):
+    repo, template = GITHUB_RELEASES[name]
+    latest = f'https://github.com/{repo}/releases/latest/download/'
+    try:
+        if name != 'macs-fan-control':
+            return electron_release(latest + 'latest-mac.yml', template, arch)
+        source = latest + template
+        target = first_redirect(source)
+        match = re.fullmatch(re.escape(f'https://github.com/{repo}/releases/download/') + r'v([0-9.]+)/macsfancontrol\.zip', target)
+        if not match or urlsplit(first_redirect(target)).hostname != 'release-assets.githubusercontent.com':
+            raise ValueError('Missing published Macs Fan Control installer')
+        return release(source, match[1])
+    except OSError:
+        # The public release/download routes do not consume REST API quota.
+        return github_api_release(name, arch)
 
 
 def sparkle_release(name, arch):
@@ -230,12 +277,23 @@ def latest(name, state, write):
         source = f'https://dl.pstmn.io/api/version/latest?platform={target}&channel=stable'
         return release(source, json.loads(fetch(source))['version'])
     if name == 'discord':
+        source = f'https://discord.com/api/downloads/distributions/app/installers/latest?arch={arch}&channel=stable&platform=osx'
+        try:
+            target = first_redirect(source)
+        except OSError:
+            target = ''
+        match = re.fullmatch(r'https://stable\.dl2\.discordapp\.net/distro/app/stable/osx/(?:universal|'
+                             + arch + r')/([0-9.]+)/Discord\.dmg(?:\?[^#]*)?', target)
+        if match:
+            return release(source, match[1])
         source = f'https://updates.discord.com/distributions/app/manifests/latest?channel=stable&platform=osx&arch={arch}'
         full = json.loads(fetch(source))['full']
         if not isinstance(full['host_version'], list) or not all(type(i) is int for i in full['host_version']):
             raise ValueError('Invalid Discord host version')
         version = '.'.join(map(str, full['host_version']))
-        if full['url'] != f'https://stable.dl2.discordapp.net/distro/app/stable/osx/universal/{version}/full.distro':
+        artifact = urlsplit(full['url'])
+        if (artifact.scheme != 'https' or artifact.hostname != 'stable.dl2.discordapp.net'
+                or artifact.path not in {f'/distro/app/stable/osx/{a}/{version}/full.distro' for a in ('universal', arch)}):
             raise ValueError('Unexpected stable Discord macOS artifact')
         return release(source, version)
     if name == 'claude':
@@ -248,12 +306,5 @@ def latest(name, state, write):
             raise ValueError('Missing current universal macOS release in the Claude Desktop feed')
         return release(source, version)
     if name == 'ledger-wallet':
-        source = 'https://download.live.ledger.com/latest-mac.yml'
-        feed = fetch(source).decode().replace('\r\n', '\n')
-        versions = re.findall(r'(?m)^version: ([0-9.]+)$', feed)
-        if len(versions) != 1 or not re.search(r'(?m)^  - url: ledger-live-desktop-' + re.escape(versions[0]) + r'-mac\.zip$', feed):
-            raise ValueError('Unrecognized Ledger Wallet macOS release manifest')
-        if re.search(r'(?m)^minimumSystemVersion:|^stagingPercentage:(?! 100\s*$)', feed):
-            raise ValueError('Ledger Wallet release eligibility is restricted by the vendor')
-        return release(source, versions[0])
+        return electron_release('https://download.live.ledger.com/latest-mac.yml', 'ledger-live-desktop-{v}-mac.zip', arch)
     raise ValueError(f'Unknown desktop release source for {name}')
