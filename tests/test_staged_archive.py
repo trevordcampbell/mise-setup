@@ -40,6 +40,17 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(maintenance.label(name), 'CodexBar')
         self.assertEqual(maintenance.VENDOR_APPS[name], feeds.APPS['codexbar'])
 
+    def test_switching_tap_is_not_reported_as_an_app_install(self):
+        old, new = 'brew-cask:codexbar', 'brew-cask:steipete/tap/codexbar'
+        suffix = '//Applications/CodexBar.app'
+        row = {'name': 'CodexBar', 'kind': 'version', 'value': '1'}
+        previous = {'inventory_after': {old + suffix: dict(row, stage=old)}}
+        before = {new + suffix: dict(row, stage=new)}
+        self.assertEqual(maintenance.background_changes(previous, before, {}), [])
+        before[new + suffix]['value'] = '2'
+        self.assertEqual(maintenance.background_changes(previous, before, {})[0]['action'], 'updated')
+        self.assertEqual(maintenance.background_changes(previous, before, {new: 'unreadable'}), [])
+
     def test_daisydisk_legacy_signature_does_not_enable_other_feeds(self):
         from xml.etree.ElementTree import Element
         item = Element('item')

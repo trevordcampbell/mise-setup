@@ -88,7 +88,7 @@ def label(name):
         'shell-completions': 'Shell completions', 'variable-fonts': 'Variable fonts and dotfiles',
         'marktext': 'MarkText', 'brew': 'Native packages', 'setup': 'Declared setup',
         'visual-studio-code': 'Visual Studio Code', 'google-chrome': 'Google Chrome',
-        'github': 'GitHub Desktop', 'iterm2': 'iTerm2', 'orbstack': 'OrbStack',
+        'github': 'GitHub Desktop', 'iterm2': 'iTerm2', '7zip': '7-Zip', 'orbstack': 'OrbStack',
         'chatgpt': 'ChatGPT', 'codexbar': 'CodexBar', 'daisydisk': 'DaisyDisk',
         'devutils': 'DevUtils', 'macs-fan-control': 'Macs Fan Control',
         'font-poppins': 'Poppins fonts', 'node': 'Node.js', 'python': 'Python',
@@ -1138,8 +1138,23 @@ def save_report(report, scheduled=False, keep=60):
 def background_changes(previous, before, errors):
     if not previous or 'inventory_after' not in previous:
         return []
-    old = previous['inventory_after']
-    invalid = set(errors) | set(previous.get('inventory_errors_after', {}))
+    def owner(stage):
+        return 'brew-cask:' + cask_token(stage) if stage.startswith('brew-cask:') else stage
+
+    def by_receipt(inventory):
+        # The same Caskroom receipt and live app can change taps without being reinstalled.
+        normalized = {}
+        for key, entry in inventory.items():
+            stage = entry['stage']
+            receipt = owner(stage)
+            if receipt != stage and key.startswith(stage + '/'):
+                key = receipt + key[len(stage):]
+            normalized[key] = dict(entry, stage=receipt)
+        return normalized
+
+    old = by_receipt(previous['inventory_after'])
+    before = by_receipt(before)
+    invalid = {owner(s) for s in set(errors) | set(previous.get('inventory_errors_after', {}))}
     observed_stages = {v['stage'] for v in before.values()}
     # Ceasing to declare an app is not proof that it was uninstalled.
     old = {k: v for k, v in old.items() if v['stage'] not in invalid and v['stage'] in observed_stages}
