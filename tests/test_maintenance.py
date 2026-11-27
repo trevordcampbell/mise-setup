@@ -187,8 +187,8 @@ class DownloadProgressTests(unittest.TestCase):
             calls.append((args, kwargs))
             log.write('already up to date\n')
         with patch.object(maintenance, 'cask_apps', return_value=[]):
-            maintenance.cask_update('brew-cask:opera', False, io.StringIO(), command)
-            maintenance.cask_update('brew-cask:opera', True, io.StringIO(), command)
+            maintenance.cask_update('brew-cask:sample', False, io.StringIO(), command)
+            maintenance.cask_update('brew-cask:sample', True, io.StringIO(), command)
         self.assertEqual([kw['timeout'] for _, kw in calls], [1800, 1800, 120, 120])
         self.assertTrue(all(isinstance(kw['progress'], maintenance.CaskDownloadProgress) for _, kw in calls[:2]))
         self.assertTrue(all('progress' not in kw for _, kw in calls[2:]))
@@ -198,7 +198,9 @@ class VendorReleaseTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.apps = Path(self.temp.name)
-        self.settings = patch.object(maintenance, 'APPLICATIONS', self.apps)
+        config = self.apps / 'config.toml'
+        config.write_text('[bootstrap.packages]\n')
+        self.settings = patch.multiple(maintenance, APPLICATIONS=self.apps, PREFIX=self.apps / 'prefix', CONFIG=config)
         self.settings.start()
         self.key = 'brew-cask:google-chrome'
         self.release = {'version': '156.0.8078.48', 'source': 'https://example.invalid/test', 'channel': 'stable'}
@@ -246,11 +248,45 @@ class VendorReleaseTests(unittest.TestCase):
         self.assertEqual(result['plans'][0]['after'], self.release['version'])
         self.assertTrue(all('--dry-run' in args for args in calls))
 
+    def test_current_app_with_opt_in_and_no_receipt_is_adopted_only_during_update(self):
+        maintenance.CONFIG.write_text('[bootstrap.packages]\n"brew-cask:google-chrome" = {adopt = true}\n')
+        self.write_app(self.key, self.release['version'], '1')
+        calls = []
+        def command(args, log, **kwargs):
+            calls.append(args)
+        with patch.object(maintenance, 'vendor_release', return_value=self.release):
+            preview = maintenance.cask_update(self.key, True, io.StringIO(), command)
+            self.assertEqual(preview['state'], 'current')
+            self.assertIn('register', preview['notes'][0])
+            self.assertFalse(calls)
+            result = maintenance.cask_update(self.key, False, io.StringIO(), command)
+        self.assertEqual(result['state'], 'current')
+        self.assertEqual(calls, [[maintenance.MISE, 'bootstrap', 'packages', 'apply', self.key, '-y']])
+
     def test_native_metadata_lag_does_not_hide_vendor_update(self):
         with patch.object(maintenance, 'vendor_release', return_value=self.release), patch.object(maintenance, 'native_cask_update', return_value={'state': 'current'}), patch.object(maintenance, 'is_running', return_value=False):
             result = maintenance.cask_update(self.key, False, io.StringIO(), None)
         self.assertEqual(result['state'], 'update-available')
         self.assertIn('did not apply', result['notes'][0])
+
+    def test_open_claude_and_t3_still_have_confirmed_availability_without_receipts(self):
+        for name in ('claude', 't3-code'):
+            key = 'brew-cask:' + name
+            release = dict(self.release, version='2.0.1')
+            self.write_app(key, '2.0.0', '2.0.0')
+            calls = []
+            def command(args, log, **kwargs):
+                calls.append(args)
+                log.write('skipped: installed app is running and updates itself\n')
+            with patch.object(maintenance, 'vendor_release', return_value=release), patch.object(maintenance, 'cask_apps', side_effect=RuntimeError('no receipt')), patch.object(maintenance, 'is_running', return_value=True):
+                pending = maintenance.cask_update(key, False, io.StringIO(), command)
+                self.assertEqual(pending['state'], 'deferred-running-app')
+                self.assertEqual(pending['plans'][0]['after'], '2.0.1')
+                self.assertTrue(calls and all('--dry-run' in args for args in calls))
+                self.write_app(key, '2.0.1', '2.0.1')
+                calls.clear()
+                self.assertEqual(maintenance.cask_update(key, False, io.StringIO(), command)['state'], 'current')
+                self.assertFalse(calls)
 
     def test_success_rereads_installed_version(self):
         def install(*args):
@@ -1484,7 +1520,10 @@ class SyncHealthHistoryTests(unittest.TestCase):
             preview = maintenance.native_cask_update(key, True, io.StringIO(), command)
         self.assertEqual(result, {'state': 'updated', 'native_upgrade': {'before': '1.0,abc', 'after': '2.0,def'}})
         self.assertNotIn('native_upgrade', preview)
-        for text in (f'mise WARN  {notice}', output.replace('upgraded sample ', 'upgraded other '),
+        retry = ('mise WARN  HTTP GET https://example.test/app.dmg attempt 2 failed after 1.25s '
+                 '(transient): connection reset; retrying in 120ms\n')
+        self.assertEqual(maintenance.cask_result(retry + output, False, applied_cask='sample'), result)
+        for text in (retry, output + retry, f'mise WARN  {notice}', output.replace('upgraded sample ', 'upgraded other '),
                      output + 'mise WARN  unable to verify eligible version\n',
                      output + 'mise brew-cask:sample: skipped: incompatible version\n'):
             with self.subTest(text=text):

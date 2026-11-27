@@ -28,9 +28,9 @@ import xml.etree.ElementTree as ET
 from urllib.request import Request, urlopen
 
 if __package__:
-    from . import dependency_audit, audit_reviews
+    from . import dependency_audit, audit_reviews, desktop_releases
 else:
-    import dependency_audit, audit_reviews
+    import dependency_audit, audit_reviews, desktop_releases
 
 HOME = Path.home()
 CONFIG = HOME / '.config/mise/config.toml'
@@ -311,6 +311,8 @@ class Console:
                     continue
                 if not self.verbose and replacement_app(note):
                     replaced_apps.append(title)
+                    continue
+                if not self.verbose and result.get('native_upgrade') and retry_notice(note):
                     continue
                 hold = re.fullmatch(r'newer (.+?) release (\S+) \(released .+?, eligible (.+?)\) ignored by minimum_release_age .*', note)
                 if hold:
@@ -1145,6 +1147,10 @@ def replacement_app(note):
     return match[1] if match else None
 
 
+def retry_notice(note):
+    return re.fullmatch(r'HTTP GET https://\S+ attempt \d+ failed after \S+ \(transient\): .+; retrying in \S+', note)
+
+
 def cask_result(text, running, *, applied_cask=None):
     """Use native platform/version checks; do not guess cask metadata versions."""
     if running and re.search(r'install cask [^/\s]+/[^\s]+', text):
@@ -1153,8 +1159,8 @@ def cask_result(text, running, *, applied_cask=None):
         return {'state': 'self-updating'}
     if applied_cask and 'skipped:' not in text:
         upgrade = re.search(rf'(?m)^(?:mise )?brew-cask: upgraded {re.escape(applied_cask)} (\S+) -> (\S+)[ \t]*$', text)
-        warnings = re.findall(r'(?m)\bWARN[ \t]+([^\r\n]+)', text)
-        if upgrade and all(replacement_app(note) for note in warnings):
+        warnings = re.finditer(r'(?m)\bWARN[ \t]+([^\r\n]+)', text)
+        if upgrade and all(replacement_app(w[1]) or (w.start() < upgrade.start() and retry_notice(w[1])) for w in warnings):
             return {'state': 'updated', 'native_upgrade': {'before': upgrade[1], 'after': upgrade[2]}}
     if 'skipped:' in text or 'WARN' in text:
         return {'state': 'availability-unknown', 'notes': [NATIVE_AVAILABILITY_NOTE]}
@@ -1166,6 +1172,7 @@ def cask_result(text, running, *, applied_cask=None):
 
 
 VENDOR_APPS = {
+    **{'brew-cask:' + name: app for name, app in desktop_releases.APPS.items()},
     'brew-cask:antigravity': ('Antigravity.app', 'com.google.antigravity'),
     'brew-cask:cursor': ('Cursor.app', 'com.todesktop.230313mzl4w4u92'),
     'brew-cask:google-chrome': ('Google Chrome.app', 'com.google.Chrome'),
@@ -1182,14 +1189,20 @@ def numeric_version(value):
     return tuple(map(int, value.split('.')))
 
 
-def compare_numeric_versions(installed, available):
+def compare_numeric_versions(installed, available, *, pad=False):
     old, new = numeric_version(installed), numeric_version(available)
-    if len(old) != len(new):
+    if pad:
+        width = max(len(old), len(new))
+        old, new = old + (0,) * (width - len(old)), new + (0,) * (width - len(new))
+    elif len(old) != len(new):
         raise ValueError(f'Incompatible version formats: {installed!r} and {available!r}')
     return (old > new) - (old < new)
 
 
 def vendor_release(key):
+    name = key.removeprefix('brew-cask:')
+    if name in desktop_releases.APPS:
+        return desktop_releases.latest(name, STATE, atomic_write)
     arm = platform.machine() in ('arm64', 'aarch64')
     if key == 'brew-cask:antigravity':
         arch = {'arm64': 'arm64', 'aarch64': 'arm64', 'x86_64': 'x64'}.get(platform.machine())
@@ -1283,17 +1296,19 @@ def assess_vendor_release(key, release):
     info = plistlib.loads((app / 'Contents/Info.plist').read_bytes())
     if info.get('CFBundleIdentifier') != identifier:
         raise ValueError(f'Unexpected bundle identity for {filename}')
-    if key == 'brew-cask:cursor':
+    if key in ('brew-cask:cursor', 'brew-cask:devin-desktop', 'brew-cask:visual-studio-code'):
         product = json.loads((app / 'Contents/Resources/app/product.json').read_text())
         if product.get('quality') != 'stable':
-            raise ValueError('Installed Cursor is not on the stable channel')
+            raise ValueError(f'Installed {label(key)} is not on the stable channel')
     installed, available = info['CFBundleShortVersionString'], release['version']
-    comparison = compare_numeric_versions(installed, available)
-    # Sparkle orders ChatGPT builds, so a same-version rebuild is an update.
-    if key == 'brew-cask:chatgpt':
-        build_comparison = compare_numeric_versions(info['CFBundleVersion'], release['build'])
+    if key == 'brew-cask:opera':
+        installed = info['CFBundleVersion']
+    pad = key.removeprefix('brew-cask:') in desktop_releases.SPARKLE_FEEDS
+    comparison = compare_numeric_versions(installed, available, pad=pad)
+    if release.get('build'):
+        build_comparison = compare_numeric_versions(info['CFBundleVersion'], release['build'], pad=pad)
         if comparison and comparison != build_comparison:
-            raise ValueError('ChatGPT marketing and build versions disagree on ordering')
+            raise ValueError(f'{label(key)} marketing and build versions disagree on ordering')
         comparison = build_comparison
         installed += f" (build {info['CFBundleVersion']})"
         available += f" (build {release['build']})"
@@ -1356,7 +1371,7 @@ def orbstack_update(key, check, log, command):
 def cask_update(key, check, log, command):
     if key == 'brew-cask:orbstack':
         return orbstack_update(key, check, log, command)
-    release, vendor_error = None, None
+    release, vendor_error, verified = None, None, None
     if key in VENDOR_APPS:
         try:
             release = vendor_release(key)
@@ -1365,7 +1380,7 @@ def cask_update(key, check, log, command):
                 assessment = assess_vendor_release(key, release)
                 log.write(f'[{now()}] {key} official vendor check: {json.dumps(assessment)}\n')
                 if assessment['state'] in ('current', 'newer'):
-                    return {'state': assessment['state'], 'vendor_check': assessment}
+                    verified = {'state': assessment['state'], 'vendor_check': assessment}
         except Exception as error:
             vendor_error = str(error)
             log.write(f'[{now()}] {key} vendor check unavailable: {error}\n')
@@ -1373,6 +1388,17 @@ def cask_update(key, check, log, command):
                 # Preserve unexpected channels, identities, and version formats.
                 return {'state': 'availability-unknown', 'vendor_check':
                         {'state': 'unverified', 'error': vendor_error, 'checked_at': now()}}
+    if verified:
+        # A restored Mac may already have the current app but no ownership receipt.
+        receipts = PREFIX / 'Caskroom' / key.removeprefix('brew-cask:')
+        if not any(receipts.glob('*/.mise-cask.toml')):
+            declaration = tomllib.loads(CONFIG.read_text()).get('bootstrap', {}).get('packages', {}).get(key)
+            if isinstance(declaration, dict) and declaration.get('adopt') is True:
+                if check:
+                    verified['notes'] = ['The next update will register this installed app with Mise.']
+                else:
+                    command([MISE, 'bootstrap', 'packages', 'apply', key, '-y'], log, timeout=1800)
+        return verified
     result = native_cask_update(key, check, log, command)
     if release is not None and vendor_error is None:
         # Re-read the live bundle after native installation; reuse this run's
@@ -1406,6 +1432,11 @@ def native_cask_update(key, check, log, command):
         # Missing packages are installed by apply. Existing ownership errors
         # are still caught by the observer and the native mutation checks.
         apps = []
+    if key in VENDOR_APPS:
+        # An existing app can be running even before bootstrap writes its first receipt.
+        bundle = APPLICATIONS / VENDOR_APPS[key][0]
+        if bundle.exists() and bundle not in apps:
+            apps.append(bundle)
     running = any(is_running(app) for app in apps)
     start = log.tell()
     if check or running:
