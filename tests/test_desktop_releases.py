@@ -136,7 +136,9 @@ class DesktopReleaseTests(unittest.TestCase):
                 item = ET.SubElement(feed, 'item')
                 for tag, text in constraints.items():
                     ET.SubElement(item, releases.S + tag).text = text
-                ET.SubElement(item, 'enclosure', {'url': f'https://{sorted(hosts)[0]}/app.zip',
+                url = ('https://github.com/steipete/CodexBar/releases/download/v1.1/CodexBar-macos-universal-1.1.zip'
+                       if name == 'codexbar' else f'https://{sorted(hosts)[0]}/app.zip')
+                ET.SubElement(item, 'enclosure', {'url': url,
                               releases.S + 'shortVersionString': '1.1', releases.S + 'version': str(build)})
             data = b'<rss>' + ET.tostring(feed) + b'</rss>'
             with patch.object(releases.platform, 'mac_ver', return_value=('26.1', '', '')):

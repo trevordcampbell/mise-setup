@@ -1,4 +1,5 @@
 """Advance a self-updating, Mise-owned app from a verified stable vendor artifact."""
+import base64
 import ctypes
 import hashlib
 import os
@@ -11,6 +12,12 @@ import subprocess
 import tempfile
 import tomllib
 from urllib.parse import urlsplit
+
+
+if __package__:
+    from . import staged_archive
+else:
+    import staged_archive
 
 
 def ownership(receipts, app):
@@ -97,11 +104,48 @@ def verify_archive(path, artifact, app, run):
     run(['node', Path(__file__).with_name('verify-sparkle.cjs'), key, artifact['signature'], path], timeout=120)
 
 
+def stage_isolated(artifact, archive, output, target, installed, run):
+    if installed.name == 'Spotify.app':
+        app = staged_archive.spotify(archive, output, run)
+    else:
+        if installed.name == 'DaisyDisk.app':
+            publisher_requirement(installed, run)
+            # This legacy signature is supplemental. The signed bundle also has to pass
+            # strict Developer ID matching and Gatekeeper before it leaves staging.
+            signature = output.parent / 'archive.sig'
+            signature.write_bytes(base64.b64decode(artifact['signature'], validate=True))
+            # Sparkle 1's sign_update signs the binary SHA-1 digest with DSA-SHA1.
+            digest = output.parent / 'archive.sha1'
+            with archive.open('rb') as f:
+                digest.write_bytes(hashlib.file_digest(f, 'sha1').digest())
+            run(['/usr/bin/openssl', 'dgst', '-sha1', '-verify', installed / 'Contents/Resources/dsa_pub.pem',
+                 '-signature', signature, digest], timeout=60)
+        app = staged_archive.app_zip(archive, output, installed.name, run)
+    verify_candidate(installed, app, [], run)
+    # The caller checks the version and repeats signing checks on the final staged copy.
+    run(['/usr/bin/ditto', app, target], timeout=300)
+
+
+def isolated_format(app, url):
+    if app.name == 'Postman.app' and re.fullmatch(r'https://dl\.pstmn\.io/download/version/[0-9.]+/osx(?:_arm64|64)', url):
+        return '.zip'
+    if app.name == 'DaisyDisk.app' and re.fullmatch(r'https://daisydiskapp\.com/+download/DaisyDisk\.zip', url):
+        return '.zip'
+    if app.name == 'Spotify.app' and url in ('https://download.scdn.co/Spotify.dmg', 'https://download.scdn.co/SpotifyARM64.dmg'):
+        return '.dmg'
+    raise ValueError('Unrecognized publisher download for isolated extraction')
+
+
 def stage(artifact, target, run, installed):
     url, algorithm = artifact['url'], artifact['algorithm']
     parts = urlsplit(url)
     suffix = Path(parts.path).suffix
-    if parts.scheme != 'https' or not parts.hostname or suffix not in ('.dmg', '.zip'):
+    if algorithm == 'isolated-app':
+        suffix = isolated_format(installed, url)
+    if suffix == '.distro' and (installed.name != 'Discord.app' or parts.hostname != 'stable.dl2.discordapp.net'
+            or algorithm != 'sha256' or not parts.path.endswith('/full.distro')):
+        raise ValueError('Expected a checksummed full Discord distribution')
+    if parts.scheme != 'https' or not parts.hostname or suffix not in ('.dmg', '.zip', '.distro'):
         raise ValueError('Vendor installer requires a supported HTTPS archive')
     if algorithm in ('sha256', 'sha512'):
         if not re.fullmatch(r'[0-9a-f]{%d}' % (hashlib.new(algorithm).digest_size * 2), artifact.get('digest', '')):
@@ -109,14 +153,45 @@ def stage(artifact, target, run, installed):
     elif algorithm == 'sparkle-ed25519':
         if not re.fullmatch(r'[A-Za-z0-9+/]{86}==', artifact.get('signature', '')) or not 0 < artifact['size'] <= 2**31:
             raise ValueError('Invalid Sparkle signature or size')
-    elif algorithm != 'developer-id-dmg' or suffix != '.dmg':
+    elif algorithm != 'isolated-app' and (algorithm != 'developer-id-dmg' or suffix != '.dmg'):
         raise ValueError('Unsupported vendor archive verification method')
     with tempfile.TemporaryDirectory(prefix='mise-vendor-download-') as tmp:
         archive = Path(tmp) / ('release' + suffix)
-        run(['/usr/bin/curl', '-qfsSL', '--proto', '=https', '--proto-redir', '=https', '--retry', '2',
+        headers = []
+        if installed.name == 'Spotify.app' and algorithm == 'isolated-app':
+            etag = artifact.get('etag', '')
+            if not re.fullmatch(r'"[a-zA-Z0-9._-]+"', etag):
+                raise ValueError('Missing Spotify installer ETag')
+            headers = ['--header', 'If-Match: ' + etag, '--dump-header', Path(tmp) / 'headers']
+        run(['/usr/bin/curl', '-qfsSL', *headers, '--proto', '=https', '--proto-redir', '=https', '--retry', '2',
              '--connect-timeout', '15', '--max-time', '300', '--max-filesize', str(artifact.get('size', 2**31)), '--output', archive, url], timeout=330)
+        if headers and staged_archive.response_etag(Path(tmp) / 'headers') != etag:
+            raise ValueError('Spotify installer changed since the vendor check')
+        if artifact.get('size') and archive.stat().st_size != artifact['size']:
+            raise ValueError('Downloaded archive size disagrees with the release manifest')
+        if algorithm == 'isolated-app':
+            output = Path(tmp) / 'extracted'
+            output.mkdir()
+            stage_isolated(artifact, archive, output, target, installed, run)
+            return
         verify_archive(archive, artifact, installed, run)
-        if suffix == '.zip':
+        if suffix == '.distro':
+            source = Path(tmp) / 'extracted'
+            source.mkdir()
+            tarball = Path(tmp) / 'discord.tar'
+            run(['node', Path(__file__).with_name('unpack-discord.cjs'), archive, tarball], timeout=120)
+            run(['/usr/bin/tar', '-xf', tarball, '-C', source, 'files/Discord.app'], timeout=180)
+            app = source / 'files/Discord.app'
+            # The publisher's tar gives framework symlinks mode 000. Restore access
+            # to the links themselves; all link targets and signed file contents stay intact.
+            for directory, dirs, files in os.walk(app):
+                for name in dirs + files:
+                    link = Path(directory) / name
+                    if link.is_symlink():
+                        os.lchmod(link, 0o755)
+            staged_archive.check_tree(app)
+            run(['/usr/bin/ditto', app, target], timeout=300)
+        elif suffix == '.zip':
             source = Path(tmp) / 'extracted'
             source.mkdir()
             # libarchive's default extraction rejects parent traversal and writes through symlinks.
@@ -139,7 +214,8 @@ def verify_candidate(app, staged, binaries, run):
     info = plistlib.loads((staged / 'Contents/Info.plist').read_bytes())
     # Bind the new signature to the trusted, currently installed publisher and bundle.
     identifier = info['CFBundleIdentifier']
-    if not re.fullmatch(r'[A-Za-z0-9.-]+', identifier):
+    old_id = plistlib.loads((app / 'Contents/Info.plist').read_bytes())['CFBundleIdentifier']
+    if identifier != old_id or not re.fullmatch(r'[A-Za-z0-9.-]+', identifier):
         raise ValueError('Invalid bundle identifier')
     requirement = publisher_requirement(app, run) + f' and identifier "{identifier}"'
     run(['/usr/bin/codesign', '--verify', '--deep', '--strict', '-R', requirement, staged], timeout=180)

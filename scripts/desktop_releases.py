@@ -15,12 +15,16 @@ import xml.etree.ElementTree as ET
 
 
 if __package__:
+    from . import staged_archive
     from .github_public import github_json
 else:
+    import staged_archive
     from github_public import github_json
 
 
 APPS = {
+    'blender': ('Blender.app', 'org.blenderfoundation.blender'),
+    'codexbar': ('CodexBar.app', 'com.steipete.codexbar'),
     'bruno': ('Bruno.app', 'com.usebruno.app'),
     'discord': ('Discord.app', 'com.hnc.Discord'),
     'github': ('GitHub Desktop.app', 'com.github.GitHubClient'),
@@ -45,6 +49,7 @@ GITHUB_RELEASES = {
     'macs-fan-control': ('crystalidea/macs-fan-control', 'macsfancontrol.zip'),
 }
 SPARKLE_FEEDS = {
+    'codexbar': ('https://raw.githubusercontent.com/steipete/CodexBar/main/appcast.xml', {'github.com'}),
     'iterm2': ('https://iterm2.com/appcasts/final_modern.xml', {'iterm2.com'}),
     'daisydisk': ('https://daisydiskapp.com/downloads/appcastFeed.php', {'daisydiskapp.com'}),
     'devutils': ('https://devutils.com/archives/appcast.xml', {'devutils.app', 'devutils.com'}),
@@ -105,12 +110,18 @@ def sparkle_asset(item, enclosure):
     signature = enclosure.get(S + 'edSignature', '')
     length = enclosure.get('length', '')
     # Defer restricted rollouts, deltas and guided/package installers to Sparkle itself.
-    if (not urlsplit(url).path.endswith(('.zip', '.dmg')) or not re.fullmatch(r'[A-Za-z0-9+/]{86}==', signature)
+    if (not urlsplit(url).path.endswith(('.zip', '.dmg'))
             or not re.fullmatch(r'[1-9][0-9]{0,9}', length) or enclosure.get(S + 'deltaFrom')
             or enclosure.get(S + 'installationType', 'application') != 'application'
             or any(item.find(S + key) is not None for key in
                    ('phasedRolloutInterval', 'minimumAutoupdateVersion', 'informationalUpdate',
                     'minimumUpdateVersion', 'maximumUpdateVersion', 'installationType'))):
+        return {}
+    if not re.fullmatch(r'[A-Za-z0-9+/]{86}==', signature):
+        legacy = enclosure.get(S + 'dsaSignature', '')
+        if (urlsplit(url).hostname == 'daisydiskapp.com' and urlsplit(url).path.lstrip('/') == 'download/DaisyDisk.zip'
+                and re.fullmatch(r'[A-Za-z0-9+/=]{48,128}', legacy)):
+            return {'artifact': {'url': url, 'algorithm': 'isolated-app', 'signature': legacy, 'size': int(length)}}
         return {}
     return {'artifact': {'url': url, 'algorithm': 'sparkle-ed25519', 'signature': signature, 'size': int(length)}}
 
@@ -214,6 +225,9 @@ def sparkle_release(name, arch):
             build = field('version') or enclosure.get(S + 'version')
             version = field('shortVersionString') or enclosure.get(S + 'shortVersionString') or build
             numbers(build)
+            if name == 'codexbar' and enclosure.get('url') != (
+                    f'https://github.com/steipete/CodexBar/releases/download/v{version}/CodexBar-macos-universal-{version}.zip'):
+                continue
             choices.append(release(source, version, build=build, **sparkle_asset(item, enclosure)))
     if not choices:
         raise ValueError('No compatible stable macOS release in the vendor appcast')
@@ -292,23 +306,13 @@ def spotify_version_from_image(source, etag):
         subprocess.run(['/usr/bin/curl', '-qfsSL', '--proto', '=https', '--proto-redir', '=https',
                         '--max-time', '180', '--max-filesize', '536870912', '--header', f'If-Match: {etag}',
                         '--dump-header', str(headers), '--output', str(image), source], check=True, timeout=185, capture_output=True)
-        final_headers = headers.read_bytes().decode('latin1').strip().split('\r\n\r\n')[-1]
-        if re.findall(r'(?im)^etag:[ \t]*([^\r\n]+)', final_headers) != [etag]:
+        if staged_archive.response_etag(headers) != etag:
             raise ValueError('Spotify installer changed during the release check')
-        # The mount point is separate from the recursively cleaned download directory.
-        mount = Path(tempfile.mkdtemp(prefix='mise-spotify-'))
-        try:
-            subprocess.run(['/usr/bin/hdiutil', 'attach', '-readonly', '-nobrowse', '-noautoopen',
-                            '-mountpoint', str(mount), str(image)], check=True, timeout=60, capture_output=True)
-            with (mount / 'Spotify.app/Contents/Info.plist').open('rb') as handle:
-                info = plistlib.load(handle)
-            if info['CFBundleIdentifier'] != APPS['spotify'][1]:
-                raise ValueError('Unexpected app in the Spotify installer')
-            return info['CFBundleShortVersionString']
-        finally:
-            if os.path.ismount(mount):
-                subprocess.run(['/usr/bin/hdiutil', 'detach', str(mount)], check=True, timeout=45, capture_output=True)
-            mount.rmdir()
+        output = Path(directory) / 'contents'
+        output.mkdir()
+        def inspect(args, **options):
+            subprocess.run(args, check=True, capture_output=True, stdin=subprocess.DEVNULL, **options)
+        return staged_archive.spotify(image, output, inspect, plist_only=True)
 
 
 def spotify_release(arch, state, write):
@@ -318,6 +322,7 @@ def spotify_release(arch, state, write):
         etag = response.headers.get('ETag', '')
     if not re.fullmatch(r'"[a-zA-Z0-9._-]+"', etag):
         raise ValueError('Spotify did not supply a strong installer identifier')
+    artifact = {'url': source, 'algorithm': 'isolated-app', 'etag': etag}
     path = state / f'spotify-{arch}-release.json'
     try:
         cached = json.loads(path.read_text())
@@ -325,10 +330,30 @@ def spotify_release(arch, state, write):
         cached = {}
     if isinstance(cached, dict) and cached.get('etag') == etag and isinstance(cached.get('version'), str):
         if re.fullmatch(r'[0-9]+(?:\.[0-9]+)+', cached['version']):
-            return release(source, cached['version'], etag=etag)
-    result = release(source, spotify_version_from_image(source, etag), etag=etag)
+            return release(source, cached['version'], etag=etag, artifact=artifact)
+    result = release(source, spotify_version_from_image(source, etag), etag=etag, artifact=artifact)
     write(path, json.dumps(result) + '\n')
     return result
+
+
+def blender_release(arch):
+    source = 'https://mirror.blender.org/release/'
+    branches = {v.decode() for v in re.findall(rb'href="\./Blender(\d+\.\d+)/"', fetch(source))}
+    for branch in sorted(branches, key=numbers, reverse=True):
+        root = f'{source}Blender{branch}/'
+        listing = fetch(root).decode()
+        suffix = 'arm64' if arch == 'arm64' else 'x64'
+        versions = re.findall(r'href="\./blender-(' + re.escape(branch) + r'\.\d+)-macos-' + suffix + r'\.dmg"', listing)
+        if not versions:
+            continue
+        version = max(versions, key=numbers)
+        name = f'blender-{version}-macos-{suffix}.dmg'
+        manifest = fetch(root + f'blender-{version}.sha256').decode()
+        sums = re.findall(r'(?m)^([a-fA-F0-9]{64})[ \t]+\*?' + re.escape(name) + r'[ \t]*$', manifest)
+        if len(sums) != 1:
+            raise ValueError('No unique publisher checksum for the Blender macOS release')
+        return release(source, version, **checksum_asset(root + name, sums[0]))
+    raise ValueError('No stable Blender macOS release for this architecture')
 
 
 def latest(name, state, write):
@@ -343,6 +368,8 @@ def latest(name, state, write):
         return redirected_release(name, arch)
     if name in ('devin-desktop', 'visual-studio-code'):
         return editor_release(name, arch)
+    if name == 'blender':
+        return blender_release(arch)
     if name == 'opera':
         return opera_release()
     if name == 'spotify':
@@ -350,7 +377,8 @@ def latest(name, state, write):
     if name == 'postman':
         target = 'osx_arm64' if arch == 'arm64' else 'osx64'
         source = f'https://dl.pstmn.io/api/version/latest?platform={target}&channel=stable'
-        return release(source, json.loads(fetch(source))['version'])
+        version = json.loads(fetch(source))['version']
+        return release(source, version, artifact={'url': f'https://dl.pstmn.io/download/version/{version}/{target}', 'algorithm': 'isolated-app'})
     if name == 'discord':
         source = f'https://discord.com/api/downloads/distributions/app/installers/latest?arch={arch}&channel=stable&platform=osx'
         try:
@@ -359,10 +387,14 @@ def latest(name, state, write):
             target = ''
         match = re.fullmatch(r'https://stable\.dl2\.discordapp\.net/distro/app/stable/osx/(?:universal|'
                              + arch + r')/([0-9.]+)/Discord\.dmg(?:\?[^#]*)?', target)
-        if match:
-            return release(source, match[1])
+        redirect_release = release(source, match[1]) if match else None
         source = f'https://updates.discord.com/distributions/app/manifests/latest?channel=stable&platform=osx&arch={arch}'
-        full = json.loads(fetch(source))['full']
+        try:
+            full = json.loads(fetch(source))['full']
+        except (OSError, ValueError, KeyError):
+            if redirect_release:
+                return redirect_release
+            raise
         if not isinstance(full['host_version'], list) or not all(type(i) is int for i in full['host_version']):
             raise ValueError('Invalid Discord host version')
         version = '.'.join(map(str, full['host_version']))
@@ -370,7 +402,13 @@ def latest(name, state, write):
         if (artifact.scheme != 'https' or artifact.hostname != 'stable.dl2.discordapp.net'
                 or artifact.path not in {f'/distro/app/stable/osx/{a}/{version}/full.distro' for a in ('universal', arch)}):
             raise ValueError('Unexpected stable Discord macOS artifact')
-        return release(source, version)
+        if redirect_release and redirect_release['version'] != version:
+            return redirect_release
+        artifact_info = checksum_asset(full['url'], full.get('package_sha256'))
+        size = full.get('package_size')
+        if artifact_info and type(size) is int and 0 < size <= 2**31:
+            artifact_info['artifact']['size'] = size
+        return release(source, version, **artifact_info)
     if name == 'claude':
         source = 'https://downloads.claude.ai/releases/darwin/universal/RELEASES.json'
         data = json.loads(fetch(source))

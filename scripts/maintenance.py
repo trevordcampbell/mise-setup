@@ -97,7 +97,7 @@ def label(name):
         'brew-cask:antigravity': 'Antigravity Desktop', 'agy': 'Antigravity CLI',
         'github:skw398/scap': 'Scap', 'uv': 'uv', 'pnpm': 'pnpm',
     }
-    short = name.removeprefix('brew-cask:').removeprefix('brew:')
+    short = name.split('/')[-1] if name.startswith('brew-cask:') and '/' in name else name.removeprefix('brew-cask:').removeprefix('brew:')
     return labels.get(name) or labels.get(short, short.replace('-', ' ').title())
 
 
@@ -420,7 +420,7 @@ class CaskDownloadProgress:
     """Observe native resumable downloads; never modify Mise's cache or receipts."""
     def __init__(self, key, *, root=None, idle_timeout=120):
         self.root = root or HOME / 'Library/Caches/mise/system-brew/casks'
-        self.pattern = '.' + key.split(':', 1)[1] + '-*.mise-part'
+        self.pattern = '.' + cask_token(key) + '-*.mise-part'
         self.idle_timeout = idle_timeout
         self.previous = self.files()
         self.active = None
@@ -711,6 +711,10 @@ def is_running(app):
     return result.returncode == 0
 
 
+def cask_token(key):
+    return key.removeprefix('brew-cask:').rsplit('/', 1)[-1]
+
+
 def cask_apps(name):
     receipts = list((Path('/opt/homebrew/Caskroom') / name).glob('*/.mise-cask.toml'))
     if not receipts:
@@ -897,7 +901,7 @@ def snapshot(name):
         artifact = config.get('vars', {}).get('marktext_artifact') or config.get('bootstrap', {}).get('packages', {}).get('macos-app:marktext', {}).get('artifact')
         return app_snapshot(APPLICATIONS / artifact, 'MarkText') if artifact else {}
     if name.startswith('brew-cask:'):
-        receipts = list((PREFIX / 'Caskroom' / name.split(':', 1)[1]).glob('*/.mise-cask.toml'))
+        receipts = list((PREFIX / 'Caskroom' / cask_token(name)).glob('*/.mise-cask.toml'))
         if not receipts:
             raise RuntimeError(f'No ownership receipt for {label(name)}')
         result = {}
@@ -1183,6 +1187,7 @@ def cask_result(text, running, *, applied_cask=None):
 
 
 VENDOR_APPS = {
+    'brew-cask:steipete/tap/codexbar': desktop_releases.APPS['codexbar'],
     **{'brew-cask:' + name: app for name, app in desktop_releases.APPS.items()},
     'brew-cask:antigravity': ('Antigravity.app', 'com.google.antigravity'),
     'brew-cask:cursor': ('Cursor.app', 'com.todesktop.230313mzl4w4u92'),
@@ -1211,7 +1216,7 @@ def compare_numeric_versions(installed, available, *, pad=False):
 
 
 def vendor_release(key):
-    name = key.removeprefix('brew-cask:')
+    name = cask_token(key)
     if name in desktop_releases.APPS:
         return desktop_releases.latest(name, STATE, atomic_write)
     arm = platform.machine() in ('arm64', 'aarch64')
@@ -1321,7 +1326,7 @@ def assess_vendor_release(key, release, app=None):
     installed, available = info['CFBundleShortVersionString'], release['version']
     if key == 'brew-cask:opera':
         installed = info['CFBundleVersion']
-    pad = key.removeprefix('brew-cask:') in desktop_releases.SPARKLE_FEEDS
+    pad = cask_token(key) in desktop_releases.SPARKLE_FEEDS
     comparison = compare_numeric_versions(installed, available, pad=pad)
     if release.get('build'):
         build_comparison = compare_numeric_versions(info['CFBundleVersion'], release['build'], pad=pad)
@@ -1432,7 +1437,7 @@ def cask_update(key, check, log, command):
                         {'state': 'unverified', 'error': vendor_error, 'checked_at': now()}}
     if verified:
         # A restored Mac may already have the current app but no ownership receipt.
-        receipts = PREFIX / 'Caskroom' / key.removeprefix('brew-cask:')
+        receipts = PREFIX / 'Caskroom' / cask_token(key)
         if not any(receipts.glob('*/.mise-cask.toml')):
             declaration = tomllib.loads(CONFIG.read_text()).get('bootstrap', {}).get('packages', {}).get(key)
             if isinstance(declaration, dict) and declaration.get('adopt') is True:
@@ -1458,8 +1463,11 @@ def cask_update(key, check, log, command):
             result['plans'] = [{'name': label(key), 'kind': 'version',
                                 'before': assessment['installed'], 'after': assessment['available']}]
             if not check and result['state'] == 'update-available':
+                if key == 'brew-cask:blender':
+                    result['notes'] = ['The publisher release is newer. Mise will install it when the Blender cask catches up.']
+                    return result
                 if release.get('artifact') and native_finished and assessment['installed']:
-                    outcome = vendor_install.install(app, PREFIX / 'Caskroom' / key.removeprefix('brew-cask:'),
+                    outcome = vendor_install.install(app, PREFIX / 'Caskroom' / cask_token(key),
                         release['artifact'], partial(assess_vendor_release, key, release), is_running,
                         lambda args, **kw: command(args, log, **kw))
                     result.update(outcome)
@@ -1480,7 +1488,7 @@ def cask_update(key, check, log, command):
 
 def native_cask_update(key, check, log, command):
     try:
-        apps = cask_apps(key.split(':', 1)[1])
+        apps = cask_apps(cask_token(key))
     except RuntimeError:
         # Missing packages are installed by apply. Existing ownership errors
         # are still caught by the observer and the native mutation checks.
@@ -1507,7 +1515,7 @@ def native_cask_update(key, check, log, command):
     command([MISE, 'bootstrap', 'packages', 'upgrade', key, '-y'], log,
             timeout=1800, progress=CaskDownloadProgress(key))
     log.flush(); log.seek(start); text = log.read(); log.seek(0, 2)
-    return cask_result(text, False, applied_cask=key.removeprefix('brew-cask:'))
+    return cask_result(text, False, applied_cask=cask_token(key))
 
 
 def restore_cask_outcomes(report):

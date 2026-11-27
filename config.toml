@@ -22,6 +22,7 @@ DISABLE_AUTOUPDATER = "1"
 AGY_CLI_DISABLE_AUTO_UPDATE = "true"
 
 [tools]
+7zip = "latest"
 node = { version = "latest", postinstall = 'sh "$HOME/.config/mise/scripts/update-bundled-manager.sh" node "$MISE_TOOL_INSTALL_PATH"' }
 python = { version = "latest", postinstall = 'sh "$HOME/.config/mise/scripts/update-bundled-manager.sh" python "$MISE_TOOL_INSTALL_PATH"' }
 bun = "latest"
@@ -52,7 +53,7 @@ osv-scanner = "latest"
 "brew-cask:postman" = { version = "latest", adopt = true }
 "brew-cask:slack" = { version = "latest", adopt = true }
 "brew-cask:visual-studio-code" = { version = "latest", adopt = true }
-"brew-cask:codexbar" = { version = "latest", adopt = true }
+"brew-cask:steipete/tap/codexbar" = { version = "latest", adopt = true }
 
 "brew-cask:orbstack" = { version = "latest", adopt = true }
 
