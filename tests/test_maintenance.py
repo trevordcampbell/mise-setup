@@ -313,6 +313,37 @@ class VendorReleaseTests(unittest.TestCase):
             with patch.object(maintenance, 'json_url', return_value=records), self.assertRaises(ValueError):
                 maintenance.vendor_release(self.key)
 
+    def test_antigravity_compares_live_bundle_with_matching_desktop_feed(self):
+        key = 'brew-cask:antigravity'
+        for machine, feed_arch, artifact_arch in [('arm64', 'arm64', 'arm'), ('x86_64', 'x64', 'x64')]:
+            url = f'https://storage.googleapis.com/antigravity-public/antigravity-hub/2.36.0-5596661662220288/darwin-{artifact_arch}/Antigravity.zip'
+            feed = f'version: 2.36.0\nfiles:\n  - url: {url}\n    size: 215731561\npath: Antigravity.zip\n'.encode()
+            with patch.object(maintenance.platform, 'machine', return_value=machine), patch.object(maintenance, 'urlopen', return_value=io.BytesIO(feed)) as fetch:
+                release = maintenance.vendor_release(key)
+            self.assertTrue(fetch.call_args.args[0].full_url.endswith(f'/manifest/latest-{feed_arch}-mac.yml'))
+            with patch.object(maintenance, 'vendor_release', return_value=release), patch.object(maintenance, 'native_cask_update') as native:
+                for version, state in [('2.36.0', 'current'), ('2.37.0', 'newer')]:
+                    self.write_app(key, version, version)
+                    for preview in (False, True):
+                        result = maintenance.cask_update(key, preview, io.StringIO(), None)
+                        self.assertEqual((result['state'], result['vendor_check']['available']), (state, '2.36.0'))
+                native.assert_not_called()
+                self.write_app(key, '2.35.1', '2.35.1')
+                native.return_value = {'state': 'self-updating'}
+                with patch.object(maintenance, 'is_running', return_value=True):
+                    result = maintenance.cask_update(key, False, io.StringIO(), None)
+                self.assertEqual(result['state'], 'deferred-running-app')
+                self.assertEqual(result['plans'][0]['after'], '2.36.0')
+
+    def test_antigravity_rejects_mismatched_or_restricted_release_evidence(self):
+        url = 'https://storage.googleapis.com/antigravity-public/antigravity-hub/2.36.0-123/darwin-arm/Antigravity.zip'
+        feed = f'version: 2.36.0\nfiles:\n  - url: {url}\n'
+        for invalid in [feed.replace('darwin-arm', 'darwin-x64'), feed.replace('2.36.0-123', '2.35.1-123'),
+                        feed.replace('antigravity-hub', 'antigravity-cli'), feed.replace('files:', 'unrelated:'),
+                        feed.replace('version: 2.36.0', 'version: 2.36.0-beta'), feed + 'stagingPercentage: 10\n']:
+            with self.subTest(invalid=invalid), patch.object(maintenance.platform, 'machine', return_value='arm64'), patch.object(maintenance, 'urlopen', return_value=io.BytesIO(invalid.encode())), self.assertRaises(ValueError):
+                maintenance.vendor_release('brew-cask:antigravity')
+
     def test_cursor_stable_version_is_independent_of_artifact_hash(self):
         key = 'brew-cask:cursor'
         self.write_app(key, '3.26.13', '3.26.13')

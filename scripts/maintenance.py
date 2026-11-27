@@ -1166,6 +1166,7 @@ def cask_result(text, running, *, applied_cask=None):
 
 
 VENDOR_APPS = {
+    'brew-cask:antigravity': ('Antigravity.app', 'com.google.antigravity'),
     'brew-cask:cursor': ('Cursor.app', 'com.todesktop.230313mzl4w4u92'),
     'brew-cask:google-chrome': ('Google Chrome.app', 'com.google.Chrome'),
     'brew-cask:chatgpt': ('ChatGPT.app', 'com.openai.codex'),
@@ -1190,6 +1191,31 @@ def compare_numeric_versions(installed, available):
 
 def vendor_release(key):
     arm = platform.machine() in ('arm64', 'aarch64')
+    if key == 'brew-cask:antigravity':
+        arch = {'arm64': 'arm64', 'aarch64': 'arm64', 'x86_64': 'x64'}.get(platform.machine())
+        if not arch:
+            raise ValueError('Unsupported architecture for the Antigravity desktop feed')
+        source = f'https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/manifest/latest-{arch}-mac.yml'
+        with urlopen(Request(source, headers={'User-Agent': 'mise-maintenance'}), timeout=30) as response:
+            payload = response.read(65537)
+        if len(payload) > 65536:
+            raise ValueError('Unexpectedly large Antigravity desktop manifest')
+        feed = payload.decode().replace('\r\n', '\n') + '\n'
+        # Read only the two fields needed from Google's Electron updater manifest.
+        versions = re.findall(r'(?m)^version:[ \t]+([^\n]+)$', feed)
+        files = re.findall(r'(?m)^files:[ \t]*\n((?:[ \t].*\n)+)', feed)
+        if len(versions) != 1 or not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', versions[0]) or len(files) != 1:
+            raise ValueError('Unrecognized Antigravity desktop release manifest')
+        if re.search(r'(?m)^minimumSystemVersion:|^stagingPercentage:(?![ \t]+100[ \t]*$)', feed):
+            raise ValueError('Antigravity desktop release eligibility is restricted by the vendor')
+        version = versions[0]
+        artifact_arch = 'arm' if arch == 'arm64' else 'x64'
+        artifact = (r'https://storage\.googleapis\.com/antigravity-public/antigravity-hub/'
+                    + re.escape(version) + rf'-[0-9]+/darwin-{artifact_arch}/Antigravity\.zip')
+        urls = re.findall(r'(?m)^[ \t]+- url:[ \t]+(\S+)[ \t]*$', files[0])
+        if not any(re.fullmatch(artifact, url) for url in urls):
+            raise ValueError('Antigravity desktop manifest lacks a matching Google macOS update artifact')
+        return {'version': version, 'source': source, 'channel': 'stable'}
     if key == 'brew-cask:cursor':
         arch = 'arm64' if arm else 'x64'
         source = f'https://api2.cursor.sh/updates/api/update/darwin-{arch}/cursor/0.0.0/stable'
